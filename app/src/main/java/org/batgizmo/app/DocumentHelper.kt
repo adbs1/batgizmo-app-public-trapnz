@@ -1,10 +1,12 @@
 package org.batgizmo.app
 
+import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Environment
 import android.provider.DocumentsContract
+import android.provider.MediaStore
 import android.provider.OpenableColumns
 import androidx.activity.compose.ManagedActivityResultLauncher
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -16,7 +18,13 @@ import timber.log.Timber
 
 class DocumentHelper {
 
-    data class UriData(val uri: Uri, val previousAvailable: Boolean, val nextAvailable: Boolean)
+    data class UriData(
+        val uri: Uri,
+        val previousAvailable: Boolean,
+        val nextAvailable: Boolean,
+        val index: Int = 0,
+        val count: Int = 1
+    )
 
     companion object {
 
@@ -100,7 +108,7 @@ class DocumentHelper {
 
                 initialUriData?.let { it ->
                     val filename = getFileName(context, it.uri)
-                    Timber.i("Selected file: $filename")
+                    Timber.i("Selected file: $filename (${it.index + 1}/${it.count})")
 
                     // The following callback calls resetUIMode():
                     onSelection(it)
@@ -126,6 +134,48 @@ class DocumentHelper {
                 return intent
             }
         }
+
+        private val chunk = Regex("\\d+|\\D+")
+
+        fun naturalCompare(a: String, b: String): Int {
+            val aParts = chunk.findAll(a).map { it.value }.toList()
+            val bParts = chunk.findAll(b).map { it.value }.toList()
+            val n = minOf(aParts.size, bParts.size)
+            for (i in 0 until n) {
+                val ap = aParts[i]
+                val bp = bParts[i]
+                val cmp = if (ap[0].isDigit() && bp[0].isDigit()) {
+                    ap.toBigInteger().compareTo(bp.toBigInteger())
+                } else {
+                    ap.compareTo(bp, ignoreCase = true)
+                }
+                if (cmp != 0) return cmp
+            }
+            return aParts.size.compareTo(bParts.size)
+        }
+
+        /**
+         * Parent folder as a MediaStore RELATIVE_PATH (trailing slash) from a SAF document id,
+         * e.g. `primary:Documents/BatGizmo/2026-09-08/20260908_210000.wav`
+         * → `Documents/BatGizmo/2026-09-08/`.
+         */
+        fun relativePathFromDocumentId(documentId: String): String? {
+            val afterColon = documentId.substringAfter(':', missingDelimiterValue = "")
+            if (afterColon.isBlank()) return null
+            if (documentId.startsWith("raw:", ignoreCase = true)) {
+                val documentsAt = afterColon.indexOf("/Documents/")
+                if (documentsAt < 0) return null
+                val fromDocuments = afterColon.substring(documentsAt + 1)
+                val parent = fromDocuments.substringBeforeLast('/', missingDelimiterValue = "")
+                return if (parent.isBlank()) null else "$parent/"
+            }
+            val parent = afterColon.substringBeforeLast('/', missingDelimiterValue = "")
+            if (parent.isBlank() || parent == afterColon) return null
+            return "$parent/"
+        }
+
+        private fun isWavName(name: String?): Boolean =
+            name?.endsWith(".wav", ignoreCase = true) == true
     }
 
     private var uriList: List<Uri>? = null
@@ -153,26 +203,39 @@ class DocumentHelper {
     private fun initDocumentState(context: Context, theList: List<Uri>): UriData? {
         reset()
 
-        // Shallow copy:
-        uriList = theList.toMutableList()
-
-        // Timber.d("rememberLauncherForActivityResult callback invoked: uriList.size = ${uriList?.size ?: "null"}")
-
-        uriList?.let { list ->
-            if (list.isNotEmpty()) {
-                val i = 0
-                currentIndex = i
-                // Timber.d("Setting currentIndex in initDocumentState() = $currentIndex")
-                return UriData(list[i], i > 0, i < list.size - 1)
-            }
+        val expanded = expandToFolderSiblings(context, theList)
+        val sorted = expanded.sortedWith { a, b ->
+            naturalCompare(
+                getFileName(context, a) ?: a.toString(),
+                getFileName(context, b) ?: b.toString()
+            )
         }
-        return null
+        uriList = sorted
+
+        if (sorted.isEmpty()) return null
+
+        val startName = theList.firstOrNull()?.let { getFileName(context, it) }
+        val start = sorted.indexOfFirst { uri ->
+            uri == theList.first() ||
+                uri.toString() == theList.first().toString() ||
+                (startName != null && getFileName(context, uri) == startName)
+        }.takeIf { it >= 0 } ?: 0
+        currentIndex = start
+        Timber.i("Review list has ${sorted.size} file(s); starting at ${start + 1}")
+        return uriDataAt(start)
+    }
+
+    fun allUris(): List<Uri> = uriList ?: emptyList()
+
+    fun hasNext(): Boolean {
+        val i = currentIndex ?: return false
+        val list = uriList ?: return false
+        return i < list.size - 1
     }
 
     fun reset() {
         uriList = null
         currentIndex = null
-        // Timber.d("Setting currentIndex in reset() = $currentIndex")
     }
 
     fun getPreviousFile(): UriData? {
@@ -181,8 +244,7 @@ class DocumentHelper {
                 if (i > 0) {
                     val previous = i - 1
                     currentIndex = previous
-                    // Timber.d("Setting currentIndex in getPreviousFile() = $currentIndex")
-                    return UriData(list[previous], previous > 0, previous < list.size - 1)
+                    return uriDataAt(previous)
                 }
             }
         }
@@ -195,11 +257,116 @@ class DocumentHelper {
                 if (i < list.size - 1) {
                     val next = i + 1
                     currentIndex = next
-                    // Timber.d("Setting currentIndex in getNextFile() = $currentIndex")
-                    return UriData(list[next], next > 0, next < list.size - 1)
+                    return uriDataAt(next)
                 }
             }
         }
         return null
     }
+
+    fun select(uri: Uri): UriData? {
+        val list = uriList ?: return null
+        val i = list.indexOfFirst { it == uri || it.toString() == uri.toString() }
+        if (i < 0) return null
+        currentIndex = i
+        return uriDataAt(i)
+    }
+
+    private fun uriDataAt(i: Int): UriData? {
+        val list = uriList ?: return null
+        if (i !in list.indices) return null
+        return UriData(list[i], i > 0, i < list.size - 1, i, list.size)
+    }
+
+    /**
+     * A single tap in the document picker only grants that one WAV. If it lives in a
+     * MediaStore folder the app can see (typical for BatGizmo night folders), include
+     * the sibling WAVs so Tag Bat can walk the night. Multi-select is left as-is.
+     */
+    private fun expandToFolderSiblings(context: Context, picked: List<Uri>): List<Uri> {
+        if (picked.size != 1) return picked
+        val pickedUri = picked[0]
+        val relativePath = resolveRelativePath(context, pickedUri) ?: return picked
+        val siblings = listWavsInRelativePath(context, relativePath)
+        if (siblings.size <= 1) return picked
+
+        val pickedName = getFileName(context, pickedUri)
+        val byName = LinkedHashMap<String, Uri>()
+        for (uri in siblings) {
+            val name = getFileName(context, uri) ?: uri.lastPathSegment ?: continue
+            byName[name] = uri
+        }
+        if (pickedName != null) byName[pickedName] = pickedUri
+        Timber.i("Expanded single pick in $relativePath to ${byName.size} WAV(s)")
+        return byName.values.toList()
+    }
+
+    private fun resolveRelativePath(context: Context, uri: Uri): String? {
+        try {
+            context.contentResolver.query(
+                uri,
+                arrayOf(MediaStore.Files.FileColumns.RELATIVE_PATH),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(MediaStore.Files.FileColumns.RELATIVE_PATH)
+                    if (idx >= 0) {
+                        val path = cursor.getString(idx)
+                        if (!path.isNullOrBlank()) return normalizeRelativePath(path)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Timber.d("RELATIVE_PATH query failed for $uri: ${e.message}")
+        }
+        if (DocumentsContract.isDocumentUri(context, uri)) {
+            try {
+                relativePathFromDocumentId(DocumentsContract.getDocumentId(uri))?.let { return it }
+            } catch (e: Exception) {
+                Timber.d("Document id parse failed for $uri: ${e.message}")
+            }
+        }
+        return null
+    }
+
+    private fun listWavsInRelativePath(context: Context, relativePath: String): List<Uri> {
+        val volumes = try {
+            MediaStore.getExternalVolumeNames(context)
+        } catch (_: Exception) {
+            setOf(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        }
+        val out = ArrayList<Uri>()
+        val projection = arrayOf(
+            MediaStore.Files.FileColumns._ID,
+            MediaStore.Files.FileColumns.DISPLAY_NAME,
+            MediaStore.Files.FileColumns.MIME_TYPE
+        )
+        val selection = "${MediaStore.Files.FileColumns.RELATIVE_PATH} = ?"
+        val args = arrayOf(relativePath)
+        for (volume in volumes) {
+            try {
+                val collection = MediaStore.Files.getContentUri(volume)
+                context.contentResolver.query(collection, projection, selection, args, null)?.use { cursor ->
+                    val idIdx = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID)
+                    val nameIdx = cursor.getColumnIndex(MediaStore.Files.FileColumns.DISPLAY_NAME)
+                    val mimeIdx = cursor.getColumnIndex(MediaStore.Files.FileColumns.MIME_TYPE)
+                    while (cursor.moveToNext()) {
+                        val name = if (nameIdx >= 0) cursor.getString(nameIdx) else null
+                        val mime = if (mimeIdx >= 0) cursor.getString(mimeIdx) else null
+                        val wav = isWavName(name) || (mime != null && mime.contains("wav", ignoreCase = true))
+                        if (!wav) continue
+                        out.add(ContentUris.withAppendedId(collection, cursor.getLong(idIdx)))
+                    }
+                }
+            } catch (e: Exception) {
+                Timber.d("MediaStore list failed for $volume $relativePath: ${e.message}")
+            }
+        }
+        return out
+    }
+
+    private fun normalizeRelativePath(path: String): String =
+        if (path.endsWith('/')) path else "$path/"
 }

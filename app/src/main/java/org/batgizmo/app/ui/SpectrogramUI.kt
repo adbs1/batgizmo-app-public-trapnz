@@ -49,6 +49,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.AccessTime
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.WbTwilight
@@ -67,9 +69,11 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
@@ -127,6 +131,7 @@ import org.batgizmo.app.UIModel
 import org.batgizmo.app.diagnosticLogger
 import org.batgizmo.app.pipeline.AbstractPipeline
 import org.batgizmo.app.pipeline.LiveAudioStartResult
+import org.batgizmo.app.review.ReviewFlag
 import org.batgizmo.app.ui.TopLevelUI.AppMode
 import timber.log.Timber
 import uk.org.gimell.batgimzoapp.BuildConfig
@@ -222,6 +227,7 @@ class SpectrogramUI(
         val showAudioConfig: MutableState<Boolean> = mutableStateOf(false),
         val showAudioFeedbackWarning: MutableState<Boolean> = mutableStateOf(false),
         val showReleaseNotes: MutableState<Boolean> = mutableStateOf(false),
+        val showTrapNz: MutableState<Boolean> = mutableStateOf(false),
         val audioSettingsAlreadyShown: MutableState<Boolean> = mutableStateOf(false),
         val heterodyneRef1kHz: MutableState<Int?> = mutableStateOf(null),
         val heterodyneRef2kHz: MutableState<Int?> = mutableStateOf(null),
@@ -255,6 +261,7 @@ class SpectrogramUI(
             showAudioConfig.value = false
             showAudioFeedbackWarning.value = false
             showReleaseNotes.value = false
+            showTrapNz.value = false
             // Keep audioSettingsAlreadyShown across file open / mode reset so a short
             // press can reuse last settings; long-press still opens the modal. Cleared
             // separately on USB stream errors (new mic may need ref sanity checks).
@@ -513,7 +520,6 @@ class SpectrogramUI(
             },
 
             bottomBar = {
-                // Put the buttons at the bottom when in portrait mode:
                 ComposeBottomBar(
                     orientation,
                     appMode,
@@ -608,7 +614,7 @@ class SpectrogramUI(
                 }
             }
             if (orientation.intValue == Configuration.ORIENTATION_LANDSCAPE && !leftHandedMode) {
-                Column {
+                Column(Modifier.zIndex(1f)) {
                     ComposeButtonsVertical(
                         innerPadding,
                         liveMode,
@@ -717,6 +723,25 @@ class SpectrogramUI(
 
         if (uiState.showReleaseNotes.value) {
             ReleaseNotesDialog(onDismiss = { uiState.showReleaseNotes.value = false })
+        }
+
+        val showReviewSummary by model.reviewSession.showSummary.collectAsStateWithLifecycle()
+        if (showReviewSummary) {
+            ReviewSummaryDialog(
+                counts = model.reviewSession.counts(),
+                onDismiss = { model.reviewSession.dismissSummary() },
+                onUpload = {
+                    model.reviewSession.dismissSummary()
+                    uiState.showTrapNz.value = true
+                }
+            )
+        }
+        if (uiState.showTrapNz.value) {
+            TrapNzDialog(
+                context = LocalContext.current,
+                reviewSession = model.reviewSession,
+                onDismiss = { uiState.showTrapNz.value = false }
+            )
         }
 
         if (uiState.showInternalMicFallbackDialog.value) {
@@ -1134,9 +1159,18 @@ class SpectrogramUI(
         appMode: MutableIntState,
         liveMode: MutableIntState
     ) {
-        if (orientation.intValue == Configuration.ORIENTATION_PORTRAIT) {
-            BottomAppBar {
-                ComposeButtonsHorizontal(liveMode, appMode)
+        val showReview =
+            appMode.intValue == AppMode.VIEWER.value && uiState.fileIsOpen.value
+        val showPortraitButtons =
+            orientation.intValue == Configuration.ORIENTATION_PORTRAIT
+        if (!showReview && !showPortraitButtons) return
+        Column(Modifier.background(MaterialTheme.colorScheme.surface)) {
+            // Scaffold bottomBar, not a spectrogram sibling: SurfaceView cannot punch through it.
+            ComposeReviewActionBar(appMode)
+            if (showPortraitButtons) {
+                BottomAppBar {
+                    ComposeButtonsHorizontal(liveMode, appMode)
+                }
             }
         }
     }
@@ -1178,6 +1212,96 @@ class SpectrogramUI(
         )
     }
 
+    /**
+     * Lives in the Scaffold bottomBar, just below the spectrogram, not as a SurfaceView sibling.
+     * On this Samsung the SurfaceView punches a black hole through Compose siblings.
+     */
+    @Composable
+    private fun ComposeReviewActionBar(appMode: MutableIntState) {
+        if (appMode.intValue != AppMode.VIEWER.value || !uiState.fileIsOpen.value) return
+        val context = LocalContext.current
+        val reviewItems by model.reviewSession.items.collectAsStateWithLifecycle()
+        val reviewIndex by model.reviewSession.index.collectAsStateWithLifecycle()
+        val current = reviewItems.getOrNull(reviewIndex)
+        val position = if (reviewItems.isNotEmpty() && reviewIndex >= 0)
+            "${reviewIndex + 1}/${reviewItems.size}"
+        else
+            ""
+        val batsSelected = current?.flag == ReviewFlag.BATS
+        val noBatsSelected = current?.flag == ReviewFlag.NO_BATS
+        Column {
+            HorizontalDivider()
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp, vertical = 4.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "Tags",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        position,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(
+                        onClick = { openAdjacentReviewFile(context, next = false) },
+                        enabled = buttonState.previousFileEnabled.value
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft,
+                            contentDescription = "Previous file"
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.weight(1f),
+                        horizontalArrangement = Arrangement.spacedBy(
+                            8.dp,
+                            Alignment.CenterHorizontally
+                        ),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        FilterChip(
+                            selected = batsSelected,
+                            onClick = { tagCurrentAndAdvance(context, ReviewFlag.BATS) },
+                            label = { Text("Bats") }
+                        )
+                        FilterChip(
+                            selected = noBatsSelected,
+                            onClick = { tagCurrentAndAdvance(context, ReviewFlag.NO_BATS) },
+                            label = { Text("No Bats") }
+                        )
+                    }
+                    IconButton(
+                        onClick = { openAdjacentReviewFile(context, next = true) },
+                        enabled = buttonState.nextFileEnabled.value
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                            contentDescription = "Next file"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     @Composable
     private fun ComposeNavigationIcon(
         documentPickerLauncher: ManagedActivityResultLauncher<Array<String>, List<Uri>>,
@@ -1189,6 +1313,7 @@ class SpectrogramUI(
         var iconButtonCoordinates by remember { mutableStateOf(Offset.Zero) }
         var iconButtonSize by remember { mutableStateOf(IntSize.Zero) }
         var menuExpanded by remember { uiState.menuExpanded }
+        val reviewItems by model.reviewSession.items.collectAsStateWithLifecycle()
 
         IconButton(onClick = {
             menuExpanded = true
@@ -1229,6 +1354,18 @@ class SpectrogramUI(
                     contentDescription = "File info")
                 },
                 enabled = uiState.fileIsOpen.value
+            )
+            DropdownMenuItem(
+                text = { Text("Review results") },
+                onClick = {
+                    menuExpanded = false
+                    model.reviewSession.showSummary()
+                },
+                leadingIcon = { Icon(
+                    imageVector = Icons.Filled.Info,
+                    contentDescription = "Review results")
+                },
+                enabled = reviewItems.isNotEmpty()
             )
             DropdownMenuItem(
                 text = { Text("Close file") },
@@ -1614,12 +1751,7 @@ class SpectrogramUI(
         }
         else {
             fun gotoFile(uriData: DocumentHelper.UriData) {
-                stopAudioAndResetUi()
-                val filename = DocumentHelper.getFileName(context, uriData.uri)
-                model.closePipeline()
-                openFile(uriData.uri, filename ?: uriData.uri.toString())
-                buttonState.previousFileEnabled.value = uriData.previousAvailable
-                buttonState.nextFileEnabled.value = uriData.nextAvailable
+                openReviewFile(context, uriData.uri, uriData)
             }
             MyButton(
                 Icons.Filled.KeyboardArrowUp, "Previous file",
@@ -1814,6 +1946,43 @@ class SpectrogramUI(
         uiState.reset()
     }
 
+    private fun openReviewFile(
+        context: Context,
+        uri: Uri,
+        uriData: DocumentHelper.UriData? = model.documentHelper.select(uri)
+    ) {
+        stopAudioAndResetUi()
+        val filename = DocumentHelper.getFileName(context, uri) ?: uri.toString()
+        model.closePipeline()
+        openFile(uri, filename)
+        if (uriData != null) {
+            buttonState.previousFileEnabled.value = uriData.previousAvailable
+            buttonState.nextFileEnabled.value = uriData.nextAvailable
+        }
+        model.reviewSession.select(uri)
+    }
+
+    private fun openAdjacentReviewFile(context: Context, next: Boolean) {
+        val uriData = if (next) model.documentHelper.getNextFile()
+            else model.documentHelper.getPreviousFile()
+        if (uriData != null) {
+            openReviewFile(context, uriData.uri, uriData)
+        }
+    }
+
+    private fun tagCurrentAndAdvance(context: Context, flag: ReviewFlag) {
+        model.reviewSession.tagCurrent(flag)
+        val nextFromPicker = if (model.documentHelper.hasNext())
+            model.documentHelper.getNextFile()
+        else
+            null
+        if (nextFromPicker != null) {
+            openReviewFile(context, nextFromPicker.uri, nextFromPicker)
+            return
+        }
+        model.reviewSession.showSummary()
+    }
+
     /**
      * Responds to an event to change the UI to a viewer in reset state, whatever state it is in
      * currently.
@@ -1831,6 +2000,11 @@ class SpectrogramUI(
         }
 
         if (uriData != null) {
+            val uris = model.documentHelper.allUris()
+            if (uris.isNotEmpty())
+                model.reviewSession.begin(uris)
+            else
+                model.reviewSession.begin(listOf(uriData.uri))
             viewUri(context, model, uriData)
         }
 

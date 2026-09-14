@@ -6,10 +6,13 @@ plugins {
 }
 
 android {
+    val releaseKeystore = file("/home/jmears/src/gizmokeystore.jks")
     signingConfigs {
         create("release") {
-            storeFile = file("/home/jmears/src/gizmokeystore.jks")
-            keyAlias = "key0"
+            if (releaseKeystore.isFile) {
+                storeFile = releaseKeystore
+                keyAlias = "key0"
+            }
         }
     }
     namespace = "uk.org.gimell.batgimzoapp"
@@ -36,7 +39,9 @@ android {
                 cFlags += "-O3"
             }
         }
-        signingConfig = signingConfigs.getByName("release")
+        if (releaseKeystore.isFile) {
+            signingConfig = signingConfigs.getByName("release")
+        }
     }
 
     buildTypes {
@@ -46,7 +51,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.getByName("release")
+            if (releaseKeystore.isFile) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
         getByName("debug") {
             applicationIdSuffix = "debug"

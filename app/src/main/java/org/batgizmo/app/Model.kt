@@ -70,6 +70,7 @@ import org.batgizmo.app.pipeline.UsbHighRateMicProbeResult
 import org.batgizmo.app.ui.GraphBase
 import org.batgizmo.app.ui.SpectrogramGestureAxis
 import org.batgizmo.app.ui.SpectrogramUI
+import org.batgizmo.app.review.ReviewSession
 import org.batgizmo.app.ui.TopLevelUI
 import org.batgizmo.app.ui.TopLevelUI.AppMode
 import timber.log.Timber
@@ -740,6 +741,7 @@ class UIModel(application: Application,
     }
 
     val documentHelper = DocumentHelper()
+    val reviewSession = ReviewSession(getApplication(), viewModelScope)
 
     init {
         Timber.d("Creating instance of UIModel")
@@ -872,6 +874,7 @@ class UIModel(application: Application,
 
                     pipeline = p
                     wavFileInfo.set(wfi)
+                    reviewSession.enrichFromOpen(uri, wfi)
                     // This has a side affect of updating the axis ranges in the UI:
                     internalSetSpectrogramVisibleRange(FloatRange(0f, 1f), FloatRange(0f, 1f))
 
