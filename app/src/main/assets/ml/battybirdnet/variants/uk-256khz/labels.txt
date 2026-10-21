@@ -1,0 +1,20 @@
+Barbastella barbastellus_Western barbastelle
+Myotis bechsteinii_Bechsteins bat
+Myotis daubentonii_Daubentons bat
+Myotis myotis_Greater mouse-eared bat
+Myotis mystacinus_Whiskered bat
+Myotis nattereri_Natterers bat
+Nyctalus leisleri_Leislers bat
+Nyctalus noctula_Common noctule
+Pipistrellus nathusii_Nathusius pipistrelle
+Pipistrellus pipistrellus_Common pipistrelle
+Pipistrellus pygmaeus_Soprano pipistrelle
+Plecotus auritus_Brown long eared bat
+Rhinolophus ferrumequinum_Greater horseshoe bat
+Rhinolophus hipposideros_Lesser horseshoe bat
+Tettigoniidea_Cricket
+audiomoth
+background
+noise
+other
+silence

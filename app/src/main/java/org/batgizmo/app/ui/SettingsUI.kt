@@ -22,21 +22,36 @@
 
 package org.batgizmo.app.ui
 
+import android.content.Context
+import android.content.res.Configuration
+import android.net.Uri
+import android.os.Build
+import android.os.storage.StorageManager
+import android.os.storage.StorageVolume
+import android.provider.MediaStore
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -44,11 +59,15 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -60,15 +79,26 @@ import androidx.compose.runtime.toMutableStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.batgizmo.app.AutoIdFamilyPref
 import org.batgizmo.app.Settings
 import org.batgizmo.app.UIModel
 import org.batgizmo.app.diagnosticLogger
+import org.batgizmo.app.ml.ByomCommitException
+import org.batgizmo.app.ml.LabelCatalogEntry
+import org.batgizmo.app.ml.MlCatalog
+import org.batgizmo.app.ml.MlModelDescriptor
+import timber.log.Timber
+import java.util.Locale
 
 class SettingsUI(private val model: UIModel) {
 
@@ -122,6 +152,31 @@ class SettingsUI(private val model: UIModel) {
         var liveInputSource by rememberSaveable { mutableStateOf(model.settings.liveInputSource) }
         var internalMicId by rememberSaveable { mutableStateOf(model.settings.internalMicId) }
         var unlimitedFileLength by rememberSaveable { mutableStateOf(model.settings.unlimitedFileLength) }
+        var wavStorageVolume by rememberSaveable { mutableStateOf(model.settings.wavStorageVolume) }
+        var autoTriggerMode by rememberSaveable { mutableStateOf(model.settings.autoTriggerMode) }
+        var postTriggerTimeMs by rememberSaveable { mutableStateOf(model.settings.postTriggerTimeMs) }
+        val energyControlsEnabled =
+            autoTriggerMode == Settings.AutoTriggerModeOptions.ENERGY.value
+        // Local so Language / Suppressions / enable react when Auto ID settings change
+        // (model.settings is a plain var and does not trigger recomposition on its own):
+        var autoIdEnabled by rememberSaveable { mutableStateOf(model.settings.autoIdEnabled) }
+        var autoIdModelId by rememberSaveable { mutableStateOf(model.settings.autoIdModelId) }
+
+        var classifierWindowSec by remember { mutableStateOf<Float?>(null) }
+        LaunchedEffect(autoIdModelId) {
+            classifierWindowSec = withContext(Dispatchers.IO) {
+                try {
+                    MlCatalog.ensureInitialized(context.applicationContext)
+                    val desc = MlCatalog.resolveDescriptor(context.assets, autoIdModelId)
+                    Settings.classifierWindowDurationSec(
+                        desc.windowSamples,
+                        desc.sampleRateHz,
+                    )
+                } catch (_: Exception) {
+                    null
+                }
+            }
+        }
 
         // Expand/collapse state for each collapsible section, indexed by SettingsSection.ordinal.
         // Held here (rather than inside the list items) so the LazyColumn can gate which sections'
@@ -441,7 +496,7 @@ class SettingsUI(private val model: UIModel) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         MyListSelector<Settings.DataBufferTimeSpanOptions>(
                             Settings.DataBufferTimeSpanOptions.entries,
-                            "Maximum viewable time span (restart needed)",
+                            "Maximum viewable time span (higher values degrade time resolution, restart needed)",
                             model.settings.pipelineParameters.dataPageTimeSpanS
                         ) { value: Int ->
                             // Signal the updated settings values:
@@ -482,16 +537,42 @@ class SettingsUI(private val model: UIModel) {
                 }
 
                 item {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        MyListSelector<Settings.PostTriggerTimeOptions>(
-                            Settings.PostTriggerTimeOptions.entries,
-                            "Post trigger",
-                            model.settings.postTriggerTimeMs
-                        ) { value: Int ->
-                            // Signal the updated settings values:
-                            scope.launch {
-                                model.updateStoredSettings(model.settings.copy(postTriggerTimeMs = value))
+                    val classifierAuto =
+                        autoTriggerMode == Settings.AutoTriggerModeOptions.CLASSIFIER.value
+                    val windowSec = classifierWindowSec
+                    val postHint = if (classifierAuto && windowSec != null) {
+                        val ceiled = Settings.ceiledClassifierPostTrigger(
+                            postTriggerTimeMs,
+                            windowSec,
+                        )
+                        val windowWord =
+                            if (ceiled.windowCount == 1) "window" else "windows"
+                        "Records ${Settings.prettySeconds(ceiled.durationSec)} " +
+                            "(${ceiled.windowCount} $windowWord)"
+                    } else {
+                        null
+                    }
+                    Column {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            MyListSelector<Settings.PostTriggerTimeOptions>(
+                                Settings.PostTriggerTimeOptions.entries,
+                                "Post trigger",
+                                postTriggerTimeMs
+                            ) { value: Int ->
+                                postTriggerTimeMs = value
+                                scope.launch {
+                                    model.updateStoredSettings(
+                                        model.settings.copy(postTriggerTimeMs = value)
+                                    )
+                                }
                             }
+                        }
+                        postHint?.let { hint ->
+                            Text(
+                                hint,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
                         }
                     }
                 }
@@ -526,11 +607,51 @@ class SettingsUI(private val model: UIModel) {
                 }
 
                 item {
+                    val wavVolumeOptions = remember(wavStorageVolume) {
+                        wavStorageVolumeOptions(context, wavStorageVolume)
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        MyDynamicSelector(
+                            options = wavVolumeOptions,
+                            description = "WAV file storage location",
+                            selectedValue = wavStorageVolume
+                        ) { value: String ->
+                            wavStorageVolume = value
+                            scope.launch {
+                                model.updateStoredSettings(
+                                    model.settings.copy(wavStorageVolume = value)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                item {
                     HorizontalDivider(thickness = 2.dp)
 
-                    // Remember a coroutine scope tied to Compose lifecycle
-                    val scope = rememberCoroutineScope()
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        MyListSelector<Settings.AutoTriggerModeOptions>(
+                            Settings.AutoTriggerModeOptions.entries,
+                            "Trigger type",
+                            autoTriggerMode
+                        ) { value: Int ->
+                            autoTriggerMode = value
+                            if (value == Settings.AutoTriggerModeOptions.CLASSIFIER.value) {
+                                autoIdEnabled = true
+                            }
+                            scope.launch {
+                                model.updateStoredSettings(
+                                    model.settings.copy(
+                                        autoTriggerMode = value,
+                                        autoIdEnabled = autoIdEnabled,
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
 
+                item {
                     // State to hold the current color
                     var color by remember { mutableStateOf(androidx.compose.ui.graphics.Color.DarkGray) }
 
@@ -552,16 +673,21 @@ class SettingsUI(private val model: UIModel) {
                             }
                         }
                     }
+                    val lampLabelColor = if (energyControlsEnabled)
+                        MaterialTheme.colorScheme.onSurface
+                    else
+                        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("Trigger")
-                        MyLamp2(20.dp, color)
+                        Text("Trigger", color = lampLabelColor)
+                        MyLamp2(20.dp, color, enabled = energyControlsEnabled)
                     }
                 }
 
                 item {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         MyFloatSlider("Trigger threshold (dB)", "%.1f",
-                            model.settings.autoTriggerThresholdDb, -25f..70f) {
+                            model.settings.autoTriggerThresholdDb, -25f..70f,
+                            enabled = energyControlsEnabled) {
                             value: Float ->
                             scope.launch {
                                 model.updateStoredSettings(model.settings.copy(autoTriggerThresholdDb = value))
@@ -575,13 +701,506 @@ class SettingsUI(private val model: UIModel) {
                         MyFloatRangeSlider("Trigger range (kHz)", "%.1f",
                             model.settings.autoTriggerRangeMinkHz,
                             model.settings.autoTriggerRangeMaxkHz,
-                            10f..120f) {
+                            10f..120f,
+                            enabled = energyControlsEnabled) {
                                 range: ClosedFloatingPointRange<Float> ->
                             scope.launch {
                                 model.updateStoredSettings(model.settings.copy(
                                     autoTriggerRangeMinkHz = range.start, autoTriggerRangeMaxkHz = range.endInclusive))
                             }
                         }
+                    }
+                }
+            }
+
+            settingsSection(SettingsSection.AUTO_ID, expandedSections) {
+                item {
+                    key(autoIdEnabled) {
+                        MyCheckbox(
+                            "Enable auto classification", autoIdEnabled
+                        ) { value: Boolean ->
+                            autoIdEnabled = value
+                            scope.launch {
+                                model.updateStoredSettings(
+                                    model.settings.copy(autoIdEnabled = value)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                item {
+                    data class AutoIdFamily(
+                        val id: String,
+                        val displayName: String,
+                        val variants: List<MlModelDescriptor>,
+                        val isByom: Boolean,
+                    )
+                    var catalogRevision by remember { mutableIntStateOf(0) }
+                    var importBusy by remember { mutableStateOf(false) }
+                    var importError by remember { mutableStateOf<String?>(null) }
+                    var confirmRemove by remember { mutableStateOf(false) }
+                    var pendingOverwrite by remember {
+                        mutableStateOf<PendingByomOverwrite?>(null)
+                    }
+
+                    LaunchedEffect(Unit) {
+                        withContext(Dispatchers.IO) {
+                            MlCatalog.ensureInitialized(context)
+                        }
+                        catalogRevision++
+                    }
+
+                    val descriptors = remember(catalogRevision) {
+                        MlCatalog.listDescriptors(context.assets)
+                    }
+                    // Families that currently have at least one installable variant.
+                    val families = remember(descriptors) {
+                        descriptors
+                            .groupBy { it.familyId }
+                            .map { (familyId, variants) ->
+                                AutoIdFamily(
+                                    id = familyId,
+                                    displayName = variants.first().familyDisplayName,
+                                    // Family defaultVariantId (if present) first, then A–Z.
+                                    variants = variants.sortedWith(
+                                        compareBy<MlModelDescriptor> {
+                                            it.id != it.familyDefaultVariantId
+                                        }.thenBy { it.displayName }
+                                    ),
+                                    isByom = variants.any { it.isByom },
+                                )
+                            }
+                            .sortedBy { it.displayName }
+                    }
+                    val selectedDescriptor = remember(autoIdModelId, descriptors) {
+                        descriptors.firstOrNull { it.id == autoIdModelId }
+                    }
+                    val selectedFamilyId =
+                        selectedDescriptor?.familyId
+                            ?: families.firstOrNull()?.id
+                            ?: ""
+                    val familyVariants = remember(selectedFamilyId, families) {
+                        families.firstOrNull { it.id == selectedFamilyId }?.variants.orEmpty()
+                    }
+                    val selectedIsByom = selectedDescriptor?.isByom == true
+
+                    fun versionLabel(version: String?): String =
+                        version?.takeIf { it.isNotBlank() } ?: "unknown"
+
+                    var autoIdLanguage by rememberSaveable {
+                        mutableStateOf(model.settings.autoIdLanguage)
+                    }
+
+                    fun persistSelection(
+                        modelId: String,
+                        language: Int = autoIdLanguage,
+                        alsoRemember: Map<String, AutoIdFamilyPref> = emptyMap(),
+                    ) {
+                        if (modelId.isBlank()) return
+                        autoIdModelId = modelId
+                        autoIdLanguage = language
+                        // ViewModel scope: survives file-picker / composition pauses.
+                        model.viewModelScope.launch {
+                            val desc = MlCatalog.resolveDescriptor(context.assets, modelId)
+                            val lang = language.coerceIn(
+                                0,
+                                (desc.languages.size - 1).coerceAtLeast(0),
+                            )
+                            autoIdLanguage = lang
+                            val defaults = desc.labelCatalog
+                                .filter { !it.discard }
+                                .associate { it.key to it.disableByDefault }
+                            val updated = model.settings.withAutoIdFamilySelection(
+                                familyId = desc.familyId,
+                                modelId = desc.id,
+                                language = lang,
+                                alsoRemember = alsoRemember,
+                            )
+                            updated.mergeAutoIdSuppressionDefaults(desc.id, defaults)
+                            model.updateStoredSettings(updated)
+                        }
+                    }
+
+                    fun persistModelId(modelId: String) {
+                        persistSelection(modelId)
+                    }
+
+                    val appContext = context.applicationContext
+
+                    fun runByomImport(uri: Uri, replaceExisting: Boolean) {
+                        importBusy = true
+                        importError = null
+                        model.viewModelScope.launch {
+                            try {
+                                val installed = model.importByomClassifier(
+                                    uri,
+                                    replaceExisting = replaceExisting,
+                                )
+                                catalogRevision++
+                                autoIdModelId = installed.id
+                                autoIdLanguage = model.settings.autoIdLanguage
+                            } catch (e: Exception) {
+                                Timber.e(e, "BYOM import failed")
+                                importError = when (e) {
+                                    is ByomCommitException ->
+                                        e.message ?: "Failed to install classifier"
+                                    else ->
+                                        e.message ?: e.javaClass.simpleName
+                                }
+                            } finally {
+                                importBusy = false
+                            }
+                        }
+                    }
+
+                    val importLauncher = rememberLauncherForActivityResult(
+                        ActivityResultContracts.OpenDocument()
+                    ) { uri ->
+                        if (uri == null) return@rememberLauncherForActivityResult
+                        importBusy = true
+                        importError = null
+                        pendingOverwrite = null
+                        // Must not use rememberCoroutineScope here: returning from the
+                        // document picker can leave composition and cancel that scope.
+                        model.viewModelScope.launch {
+                            try {
+                                withContext(Dispatchers.IO) {
+                                    MlCatalog.ensureInitialized(appContext)
+                                }
+                                val summary = withContext(Dispatchers.IO) {
+                                    MlCatalog.peekByomZip(appContext, uri)
+                                }
+                                val existing = MlCatalog.installedByomSummary(summary.familyId)
+                                if (existing != null) {
+                                    importBusy = false
+                                    pendingOverwrite = PendingByomOverwrite(
+                                        uri = uri,
+                                        incoming = summary,
+                                        existingVersionName = existing.versionName,
+                                    )
+                                } else {
+                                    val installed = model.importByomClassifier(
+                                        uri,
+                                        replaceExisting = false,
+                                    )
+                                    catalogRevision++
+                                    autoIdModelId = installed.id
+                                    autoIdLanguage = model.settings.autoIdLanguage
+                                    importBusy = false
+                                }
+                            } catch (e: Exception) {
+                                Timber.e(e, "BYOM import failed")
+                                importError = when (e) {
+                                    is ByomCommitException ->
+                                        e.message ?: "Failed to install classifier"
+                                    else ->
+                                        e.message ?: e.javaClass.simpleName
+                                }
+                                importBusy = false
+                            }
+                        }
+                    }
+
+                    val familyOptions = remember(families) {
+                        families.map { it.id to it.displayName }
+                    }
+                    val variantOptions = remember(familyVariants) {
+                        familyVariants.map { it.id to it.displayName }
+                    }
+                    val isLandscape =
+                        LocalConfiguration.current.orientation ==
+                            Configuration.ORIENTATION_LANDSCAPE
+                    val showFamily = familyOptions.isNotEmpty()
+                    val showVariant = familyVariants.isNotEmpty()
+
+                    val onFamilySelected: (String) -> Unit = { familyId ->
+                        val variants = families.firstOrNull { it.id == familyId }
+                            ?.variants
+                            .orEmpty()
+                        if (variants.isNotEmpty()) {
+                            if (selectedDescriptor?.familyId == familyId) {
+                                persistModelId(selectedDescriptor.id)
+                            } else {
+                                val leaving = if (selectedFamilyId.isNotBlank() &&
+                                    autoIdModelId.isNotBlank()
+                                ) {
+                                    mapOf(
+                                        selectedFamilyId to AutoIdFamilyPref(
+                                            variantId = autoIdModelId,
+                                            language = autoIdLanguage,
+                                        )
+                                    )
+                                } else {
+                                    emptyMap()
+                                }
+                                val remembered =
+                                    (model.settings.autoIdFamilyPrefs + leaving)[familyId]
+                                val nextId = remembered?.variantId
+                                    ?.takeIf { id -> variants.any { it.id == id } }
+                                    ?: variants.first().id
+                                val nextLanguages =
+                                    variants.first { it.id == nextId }.languages
+                                val nextLanguage = remembered?.language
+                                    ?.takeIf {
+                                        nextLanguages.isEmpty() || it in nextLanguages.indices
+                                    }
+                                    ?: Settings.DEFAULT_AUTO_ID_LANGUAGE.let { default ->
+                                        if (nextLanguages.isEmpty()) default
+                                        else default.coerceIn(0, nextLanguages.lastIndex)
+                                    }
+                                persistSelection(
+                                    nextId,
+                                    nextLanguage,
+                                    alsoRemember = leaving,
+                                )
+                            }
+                        }
+                    }
+
+                    if (isLandscape && showFamily && showVariant) {
+                        // Landscape: Model 2/3, Variant 1/3 on one row.
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .weight(2f)
+                                    .padding(end = 8.dp),
+                            ) {
+                                MyDynamicSelector(
+                                    options = familyOptions,
+                                    description = "Model",
+                                    selectedValue = selectedFamilyId,
+                                    enabled = autoIdEnabled,
+                                    onChange = onFamilySelected,
+                                )
+                            }
+                            Box(modifier = Modifier.weight(1f)) {
+                                MyDynamicSelector(
+                                    options = variantOptions,
+                                    description = "Variant",
+                                    selectedValue = autoIdModelId,
+                                    enabled = autoIdEnabled && familyVariants.size > 1,
+                                ) { variantId: String ->
+                                    persistModelId(variantId)
+                                }
+                            }
+                        }
+                    } else {
+                        if (showFamily) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                MyDynamicSelector(
+                                    options = familyOptions,
+                                    description = "Model",
+                                    selectedValue = selectedFamilyId,
+                                    enabled = autoIdEnabled,
+                                    onChange = onFamilySelected,
+                                )
+                            }
+                        }
+                        if (showVariant) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                MyDynamicSelector(
+                                    options = variantOptions,
+                                    description = "Variant",
+                                    selectedValue = autoIdModelId,
+                                    enabled = autoIdEnabled && familyVariants.size > 1,
+                                ) { variantId: String ->
+                                    persistModelId(variantId)
+                                }
+                            }
+                        }
+                    }
+
+                    var showSuppressions by rememberSaveable { mutableStateOf(false) }
+                    val languages = selectedDescriptor?.languages.orEmpty()
+                    val languageOptions = remember(languages) {
+                        languages.mapIndexed { index, name -> index.toString() to name }
+                    }
+                    if (languages.isNotEmpty()) {
+                        val selectedIndex =
+                            if (autoIdLanguage in languages.indices) autoIdLanguage else 0
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            MyDynamicSelector(
+                                options = languageOptions,
+                                description = "Language",
+                                selectedValue = selectedIndex.toString(),
+                                enabled = autoIdEnabled && languages.size > 1
+                            ) { value: String ->
+                                val index =
+                                    value.toIntOrNull()?.takeIf { it in languages.indices } ?: 0
+                                persistSelection(autoIdModelId, index)
+                            }
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Button(
+                            onClick = { showSuppressions = true },
+                            enabled = autoIdEnabled &&
+                                selectedDescriptor != null &&
+                                selectedDescriptor.enableSuppressionsButton
+                        ) {
+                            Text("Suppressions")
+                        }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            if (selectedIsByom) {
+                                TextButton(
+                                    onClick = { confirmRemove = true },
+                                    enabled = !importBusy
+                                ) {
+                                    Text("Remove")
+                                }
+                            }
+                            TextButton(
+                                onClick = {
+                                    importLauncher.launch(
+                                        arrayOf(
+                                            "application/zip",
+                                            "application/x-zip-compressed",
+                                        )
+                                    )
+                                },
+                                enabled = !importBusy
+                            ) {
+                                Text("Import…")
+                            }
+                        }
+                    }
+
+                    if (importBusy) {
+                        AlertDialog(
+                            onDismissRequest = {},
+                            title = { Text("Importing classifier") },
+                            text = {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                                ) {
+                                    CircularProgressIndicator()
+                                    Text("Please wait…")
+                                }
+                            },
+                            confirmButton = {},
+                        )
+                    }
+
+                    pendingOverwrite?.let { pending ->
+                        AlertDialog(
+                            onDismissRequest = { pendingOverwrite = null },
+                            title = { Text("Replace classifier?") },
+                            text = {
+                                Text(
+                                    "\"${pending.incoming.familyId}\" " +
+                                        "(version ${versionLabel(pending.existingVersionName)}) " +
+                                        "is already installed. Replace it with version " +
+                                        "${versionLabel(pending.incoming.versionName)}?"
+                                )
+                            },
+                            confirmButton = {
+                                TextButton(
+                                    onClick = {
+                                        val uri = pending.uri
+                                        pendingOverwrite = null
+                                        runByomImport(uri, replaceExisting = true)
+                                    }
+                                ) {
+                                    Text("Overwrite")
+                                }
+                            },
+                            dismissButton = {
+                                TextButton(onClick = { pendingOverwrite = null }) {
+                                    Text("Cancel")
+                                }
+                            },
+                        )
+                    }
+
+                    if (showSuppressions &&
+                        selectedDescriptor != null &&
+                        selectedDescriptor.enableSuppressionsButton
+                    ) {
+                        val labelCatalog = selectedDescriptor.labelCatalog
+                        val suppressible = remember(labelCatalog) {
+                            labelCatalog.filter { !it.discard }
+                        }
+                        MlSuppressionsDialog(
+                            entries = suppressible,
+                            languageIndex = autoIdLanguage,
+                            suppressions = model.settings.suppressionsFor(selectedDescriptor.id),
+                            onDismiss = { showSuppressions = false },
+                            onConfirm = { updated ->
+                                scope.launch {
+                                    val nested = model.settings.autoIdSuppressions +
+                                        (selectedDescriptor.id to updated)
+                                    model.updateStoredSettings(
+                                        model.settings.copy(autoIdSuppressions = nested)
+                                    )
+                                    showSuppressions = false
+                                }
+                            },
+                        )
+                    }
+
+                    if (confirmRemove && selectedDescriptor != null && selectedIsByom) {
+                        val familyName = selectedDescriptor.familyDisplayName
+                        val familyId = selectedDescriptor.familyId
+                        AlertDialog(
+                            onDismissRequest = { confirmRemove = false },
+                            title = { Text("Remove model") },
+                            text = {
+                                Text(
+                                    "Remove \"$familyName\"? This deletes the imported " +
+                                        "classifier from the device."
+                                )
+                            },
+                            confirmButton = {
+                                TextButton(
+                                    onClick = {
+                                        confirmRemove = false
+                                        model.viewModelScope.launch {
+                                            val ok = model.removeByomClassifier(familyId)
+                                            if (!ok) {
+                                                importError = "Could not remove classifier"
+                                                return@launch
+                                            }
+                                            catalogRevision++
+                                            autoIdModelId = model.settings.autoIdModelId
+                                            autoIdLanguage = model.settings.autoIdLanguage
+                                        }
+                                    }
+                                ) {
+                                    Text("Remove")
+                                }
+                            },
+                            dismissButton = {
+                                TextButton(onClick = { confirmRemove = false }) {
+                                    Text("Cancel")
+                                }
+                            },
+                        )
+                    }
+
+                    importError?.let { message ->
+                        AlertDialog(
+                            onDismissRequest = {},
+                            title = { Text("Import failed") },
+                            text = { Text(message) },
+                            confirmButton = {
+                                TextButton(onClick = { importError = null }) {
+                                    Text("OK")
+                                }
+                            },
+                        )
                     }
                 }
             }
@@ -671,6 +1290,179 @@ class SettingsUI(private val model: UIModel) {
     }
 }
 
+/** Held while the user decides whether to replace an installed BYOM pack. */
+private data class PendingByomOverwrite(
+    val uri: Uri,
+    val incoming: MlCatalog.ByomManifestSummary,
+    val existingVersionName: String?,
+)
+
+/**
+ * Modal listing Auto Id classes that are not discarded. Checkboxes bind to
+ * [suppressions] (settings per-model Auto Id suppressions); missing keys fall back
+ * to each entry's `disable_by_default`.
+ */
+@Composable
+private fun MlSuppressionsDialog(
+    entries: List<LabelCatalogEntry>,
+    languageIndex: Int,
+    suppressions: Map<String, Boolean>,
+    onDismiss: () -> Unit,
+    onConfirm: (Map<String, Boolean>) -> Unit,
+) {
+    val disabled = remember(entries, suppressions) {
+        mutableStateMapOf<String, Boolean>().apply {
+            entries.forEach { entry ->
+                put(
+                    entry.key,
+                    suppressions[entry.key] ?: entry.disableByDefault,
+                )
+            }
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Classes to ignore") },
+        text = {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 420.dp)
+            ) {
+                // Index in the key: some catalogs reuse the same Latin name for
+                // distinct classes (e.g. Bavaria horseshoe echolocation vs social).
+                itemsIndexed(
+                    entries,
+                    key = { index, entry -> "$index:${entry.key}" },
+                ) { _, entry ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            entry.displayName(languageIndex),
+                            modifier = Modifier.weight(1f),
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Checkbox(
+                            checked = disabled[entry.key] == true,
+                            onCheckedChange = { disabled[entry.key] = it }
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(disabled.toMap()) }) {
+                Text("Done")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
+/**
+ * Dropdown options for WAV storage: Default, currently attached MediaStore volumes with
+ * friendly labels, and an "Unavailable" entry if [selectedVolume] is set but missing.
+ */
+private fun wavStorageVolumeOptions(
+    context: Context,
+    selectedVolume: String
+): List<Pair<String, String>> {
+    val storageManager = context.getSystemService(StorageManager::class.java)
+    val attachedVolumes = MediaStore.getExternalVolumeNames(context)
+
+    val fromStorageVolumes = storageManager.storageVolumes.mapNotNull { volume ->
+        val name = mediaStoreVolumeName(volume) ?: return@mapNotNull null
+        if (name !in attachedVolumes) return@mapNotNull null
+        name to friendlyVolumeLabel(context, volume, name)
+    }
+
+    val labelledNames = fromStorageVolumes.map { it.first }.toSet()
+    // Attached MediaStore volumes with no matching StorageVolume entry:
+    val unmatchedAttached = attachedVolumes
+        .filter { it !in labelledNames }
+        .sorted()
+        .map { it to fallbackVolumeLabel(it) }
+
+    val labelled = (fromStorageVolumes + unmatchedAttached)
+        .sortedBy { it.first }
+        .let { disambiguateDuplicateLabels(it) }
+
+    return buildList {
+        add("" to "Default")
+        addAll(labelled)
+        if (selectedVolume.isNotEmpty() && selectedVolume !in attachedVolumes) {
+            add(selectedVolume to "Unavailable ($selectedVolume)")
+        }
+    }
+}
+
+/** Prefer [StorageVolume.getDescription], but replace UUID/hex-like OEM labels. */
+private fun friendlyVolumeLabel(
+    context: Context,
+    volume: StorageVolume,
+    volumeName: String
+): String {
+    val description = volume.getDescription(context).trim()
+    if (description.isNotEmpty() && !looksLikeVolumeId(description, volumeName, volume.uuid)) {
+        return description
+    }
+    return when {
+        volume.isPrimary -> "Internal shared storage"
+        volume.isRemovable -> "SD card"
+        else -> "External storage"
+    }
+}
+
+private fun fallbackVolumeLabel(volumeName: String): String {
+    return if (volumeName == MediaStore.VOLUME_EXTERNAL_PRIMARY) {
+        "Internal shared storage"
+    } else {
+        "External storage"
+    }
+}
+
+/** True when [text] is effectively a volume UUID / MediaStore id, not a human label. */
+private fun looksLikeVolumeId(text: String, volumeName: String, uuid: String?): Boolean {
+    if (text.equals(volumeName, ignoreCase = true)) return true
+    if (uuid != null && text.equals(uuid, ignoreCase = true)) return true
+    // FAT-style volume id (e.g. 12F7-270F) or other hex/UUID forms.
+    if (text.matches(Regex("^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$"))) return true
+    if (text.matches(Regex("^[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$"))) return true
+    if (text.matches(Regex("^[0-9A-Fa-f]{8,}$"))) return true
+    return false
+}
+
+/** If several volumes share a label, append a short id so they stay distinguishable. */
+private fun disambiguateDuplicateLabels(
+    entries: List<Pair<String, String>>
+): List<Pair<String, String>> {
+    val counts = entries.groupingBy { it.second }.eachCount()
+    return entries.map { (name, label) ->
+        if ((counts[label] ?: 0) > 1) name to "$label ($name)" else name to label
+    }
+}
+
+/** MediaStore volume id for [volume], or null if it is not indexed by MediaStore. */
+private fun mediaStoreVolumeName(volume: StorageVolume): String? {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        volume.mediaStoreVolumeName
+    } else if (volume.isPrimary) {
+        MediaStore.VOLUME_EXTERNAL_PRIMARY
+    } else {
+        volume.uuid?.uppercase(Locale.US)
+    }
+}
+
 /** The collapsible sections shown in the settings screen, in display order. */
 private enum class SettingsSection(val title: String) {
     APPEARANCE("Appearance"),
@@ -679,6 +1471,7 @@ private enum class SettingsSection(val title: String) {
     AUTO_BNC("Auto Brightness/Contrast"),
     RENDERING("Rendering"),
     RECORDING("Recording"),
+    AUTO_ID("Auto classification"),
     WARNINGS("Warnings"),
     DIAGNOSTICS("Diagnostics"),
 }

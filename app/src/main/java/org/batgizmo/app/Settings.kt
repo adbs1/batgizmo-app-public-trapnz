@@ -28,6 +28,24 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import org.json.JSONObject
+import kotlin.math.ceil
+
+/**
+ * Last-used Auto Id variant and language for one classifier family.
+ */
+data class AutoIdFamilyPref(
+    val variantId: String,
+    val language: Int,
+)
+
+/**
+ * Post-trigger duration after ceiling to a whole number of Auto Id windows.
+ */
+data class ClassifierPostTrigger(
+    val durationSec: Float,
+    val windowCount: Int,
+)
 
 /**
  * There are two kinds of settings:
@@ -69,7 +87,7 @@ data class Settings(
     var suppressUpdateNotification: Boolean = false,
     var suppressHighRateMicOffer: Boolean = false,
     /** Shape preset for auto-tuned heterodyne tracking. */
-    var autoHeterodyneMode: Int = AutoHeterodyneModeOptions.HOCKEY_STICK.value,
+    var autoHeterodyneMode: Int = AutoHeterodyneModeOptions.DEFAULT.value,
     /** Lower frequency limit (kHz) for auto heterodyne activity spans. */
     var autoHeterodyneLoMinKhz: Int = DEFAULT_AUTO_HET_LO_MIN_KHZ,
     /** Upper frequency limit (kHz) for auto heterodyne activity spans. */
@@ -81,9 +99,45 @@ data class Settings(
     var postTriggerTimeMs: Int = PostTriggerTimeOptions.POSTTRIGGER_TIME_1000MS.value,
     var maxFileTimeMs: Int = MaxFileTimeOptions.MAX_FILE_TIME_5000MS.value,
     var unlimitedFileLength: Boolean = false,
+    /**
+     * MediaStore volume for recorded WAV files. Empty means default (primary external
+     * volume). Otherwise a volume name from MediaStore.getExternalVolumeNames.
+     */
+    var wavStorageVolume: String = "",
     var autoTriggerThresholdDb: Float = 40f,
     var autoTriggerRangeMinkHz: Float = 16f,
     var autoTriggerRangeMaxkHz: Float = 120f,
+    /**
+     * Detector used when triggered recording is armed: FFT energy in a
+     * frequency band, or Auto Id classifier match.
+     */
+    var autoTriggerMode: Int = AutoTriggerModeOptions.ENERGY.value,
+    /**
+     * Master switch for Auto Id. When false, Auto Id is off but [autoIdModelId]
+     * is retained so re-enabling restores the last model.
+     */
+    var autoIdEnabled: Boolean = false,
+    /**
+     * Selected Auto Id model id (e.g. `battybirdnet/uk-256khz`).
+     * Kept even when Auto Id is off. See [org.batgizmo.app.ml.MlCatalog].
+     */
+    var autoIdModelId: String = DEFAULT_AUTO_ID_MODEL_ID,
+    /**
+     * Language for Auto Id species names: index into the labels JSON
+     * `description` array. Out-of-range values are treated as 0.
+     */
+    var autoIdLanguage: Int = DEFAULT_AUTO_ID_LANGUAGE,
+    /**
+     * Last-used variant and language per Auto Id family (classifier), so
+     * switching away and back restores the previous selection.
+     */
+    var autoIdFamilyPrefs: Map<String, AutoIdFamilyPref> = emptyMap(),
+    /**
+     * Per-model Auto Id classes to ignore: model id → (label key → ignored when
+     * true). Label keys are the first labels JSON text column. Defaults come
+     * from each label's `disable_by_default`.
+     */
+    var autoIdSuppressions: Map<String, Map<String, Boolean>> = emptyMap(),
     var pipelineParameters: PipelineParameters = PipelineParameters()
 ) {
     // Provide some abstraction to allow different enums to be handled the same way:
@@ -190,6 +244,13 @@ data class Settings(
         override fun theLabel(): String = label
     }
 
+    /**
+     * Audio playback modes passed to native as [value] ints (JNI has no enum names).
+     *
+     * WARNING: These numeric values must stay in sync with `dsp_playback_mode_t` in
+     * `app/src/main/cpp/dsp_types.h`. Renaming is fine; reordering or changing a
+     * `value` without updating C++ will silently pick the wrong DSP path.
+     */
     enum class AudioPlaybackModeOptions(val value: Int, val label: String) : EnumHelper {
         AUTO_TUNED_HETERODYNE(5, "Auto heterodyne"),
         SINGLE_HETERODYNE(0, "Classic heterodyne"),
@@ -212,7 +273,7 @@ data class Settings(
         override fun theLabel(): String = label
 
         companion object {
-            val DEFAULT = HOCKEY_STICK
+            val DEFAULT = MYOTIS
             fun coerce(mode: Int): Int =
                 entries.firstOrNull { it.value == mode }?.value ?: DEFAULT.value
         }
@@ -220,6 +281,8 @@ data class Settings(
 
     /** Pitch division ratios for TD-OLA playback (value = ÷ factor). */
     enum class AudioPitchRatioOptions(val value: Int, val label: String) : EnumHelper {
+        PITCH_2(2, "2"),
+        PITCH_3(3, "3"),
         PITCH_4(4, "4"),
         PITCH_6(6, "6"),
         PITCH_8(8, "8"),
@@ -409,6 +472,21 @@ data class Settings(
         override fun theLabel(): String = label
     }
 
+    /** Auto-record detector when triggered recording is armed. */
+    enum class AutoTriggerModeOptions(val value: Int, val label: String) : EnumHelper {
+        ENERGY(0, "Energy threshold"),
+        CLASSIFIER(1, "Classifier match");
+
+        override fun theValue(): Int = value
+        override fun theLabel(): String = label
+
+        companion object {
+            val DEFAULT = ENERGY
+            fun coerce(mode: Int): Int =
+                entries.firstOrNull { it.value == mode }?.value ?: DEFAULT.value
+        }
+    }
+
     enum class MaxFileTimeOptions(val value: Int, val label: String) : EnumHelper {
         MAX_FILE_TIME_500MS(500, "0.5s"),
         MAX_FILE_TIME_1000MS(1000, "1s"),
@@ -448,12 +526,217 @@ data class Settings(
         const val DEFAULT_AUTO_HET_LO_MIN_KHZ = 16
         const val DEFAULT_AUTO_HET_LO_MAX_KHZ = 120
 
+        /** Default Auto Id species-name language index (labels JSON `description`: Latin=0, English=1). */
+        const val DEFAULT_AUTO_ID_LANGUAGE = 1
+
+        /** Default bundled Auto Id model id. */
+        const val DEFAULT_AUTO_ID_MODEL_ID = "battybirdnet/uk-256khz"
+
         /** Valid auto heterodyne activity-span frequency limits (kHz). */
         const val AUTO_HET_LO_LIMIT_MIN_KHZ = 10
         const val AUTO_HET_LO_LIMIT_MAX_KHZ = 130
 
         fun isAutoHeterodyneSampleRateApplicable(sampleRateHz: Int): Boolean =
             sampleRateHz >= AUTO_HET_MIN_SAMPLE_RATE_HZ
+
+        /**
+         * BattyBirdNET window (144000 samples at 256 kHz). Used when the
+         * Auto Id model cannot be resolved.
+         */
+        const val CLASSIFIER_WINDOW_FALLBACK_SEC = 0.5625f
+
+        /**
+         * Analysed Auto Id window length in seconds, or null if the geometry is invalid.
+         */
+        fun classifierWindowDurationSec(windowSamples: Int, sampleRateHz: Int): Float? {
+            if (windowSamples <= 0 || sampleRateHz <= 0) return null
+            return windowSamples.toFloat() / sampleRateHz.toFloat()
+        }
+
+        /**
+         * Ceil [postTriggerTimeMs] to a whole number of classifier windows, at least one.
+         */
+        fun ceiledClassifierPostTrigger(
+            postTriggerTimeMs: Int,
+            windowDurationSec: Float,
+        ): ClassifierPostTrigger {
+            require(windowDurationSec > 0f) { "windowDurationSec must be > 0" }
+            val requestedSec = maxOf(postTriggerTimeMs, 0) / 1000f
+            val n = ceil((requestedSec / windowDurationSec).toDouble()).toInt().coerceAtLeast(1)
+            return ClassifierPostTrigger(n * windowDurationSec, n)
+        }
+
+        /** Compact seconds label, e.g. `1.125s`. */
+        fun prettySeconds(seconds: Float): String {
+            val s = "%.4f".format(seconds).trimEnd('0').trimEnd('.')
+            return "${s}s"
+        }
+
+        /** Serialise a flat label-key → suppressed map. */
+        fun labelSuppressionsToJson(map: Map<String, Boolean>): String {
+            val root = JSONObject()
+            for ((key, value) in map) {
+                root.put(key, value)
+            }
+            return root.toString()
+        }
+
+        /** Parse a flat label-key → suppressed JSON object; invalid input yields empty. */
+        fun labelSuppressionsFromJson(json: String): Map<String, Boolean> {
+            return try {
+                val root = JSONObject(json)
+                buildMap {
+                    val keys = root.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        put(key, root.getBoolean(key))
+                    }
+                }
+            } catch (_: Exception) {
+                emptyMap()
+            }
+        }
+
+        /** Serialise [autoIdSuppressions] as `{ modelId: { labelKey: bool } }`. */
+        fun autoIdSuppressionsToJson(map: Map<String, Map<String, Boolean>>): String {
+            val root = JSONObject()
+            for ((modelId, labels) in map) {
+                val nested = JSONObject()
+                for ((key, value) in labels) {
+                    nested.put(key, value)
+                }
+                root.put(modelId, nested)
+            }
+            return root.toString()
+        }
+
+        /**
+         * Parse nested or legacy flat suppressions JSON.
+         * Legacy flat maps (label → bool) are nested under [DEFAULT_AUTO_ID_MODEL_ID].
+         */
+        fun autoIdSuppressionsFromJson(json: String): Map<String, Map<String, Boolean>> {
+            return try {
+                val root = JSONObject(json)
+                if (root.length() == 0) return emptyMap()
+                val keys = root.keys()
+                val firstKey = keys.next()
+                val firstVal = root.get(firstKey)
+                // Legacy flat map: values are booleans.
+                if (firstVal is Boolean) {
+                    return mapOf(DEFAULT_AUTO_ID_MODEL_ID to labelSuppressionsFromJson(json))
+                }
+                buildMap {
+                    put(firstKey, labelSuppressionsFromJson(firstVal.toString()))
+                    while (keys.hasNext()) {
+                        val modelId = keys.next()
+                        put(modelId, labelSuppressionsFromJson(root.get(modelId).toString()))
+                    }
+                }
+            } catch (_: Exception) {
+                emptyMap()
+            }
+        }
+
+        /** Serialise [autoIdFamilyPrefs] as `{ familyId: { variant, language } }`. */
+        fun autoIdFamilyPrefsToJson(map: Map<String, AutoIdFamilyPref>): String {
+            val root = JSONObject()
+            for ((familyId, pref) in map) {
+                if (familyId.isBlank() || pref.variantId.isBlank()) continue
+                root.put(
+                    familyId,
+                    JSONObject().apply {
+                        put("variant", pref.variantId)
+                        put("language", pref.language)
+                    },
+                )
+            }
+            return root.toString()
+        }
+
+        /** Parse [autoIdFamilyPrefs] JSON; invalid input yields empty. */
+        fun autoIdFamilyPrefsFromJson(json: String): Map<String, AutoIdFamilyPref> {
+            return try {
+                val root = JSONObject(json)
+                buildMap {
+                    val keys = root.keys()
+                    while (keys.hasNext()) {
+                        val familyId = keys.next()
+                        val obj = root.optJSONObject(familyId) ?: continue
+                        val variant = obj.optString("variant")
+                        if (familyId.isBlank() || variant.isBlank()) continue
+                        put(
+                            familyId,
+                            AutoIdFamilyPref(
+                                variantId = variant,
+                                language = obj.optInt("language", DEFAULT_AUTO_ID_LANGUAGE),
+                            ),
+                        )
+                    }
+                }
+            } catch (_: Exception) {
+                emptyMap()
+            }
+        }
+    }
+
+    /** True when Auto Id is on. */
+    fun isAutoIdEnabled(): Boolean = autoIdEnabled
+
+    /** True when triggered recording uses the FFT energy detector. */
+    fun isEnergyAutoTrigger(): Boolean =
+        AutoTriggerModeOptions.coerce(autoTriggerMode) ==
+            AutoTriggerModeOptions.ENERGY.value
+
+    /** True when triggered recording uses Auto Id classifier matches. */
+    fun isClassifierAutoTrigger(): Boolean =
+        AutoTriggerModeOptions.coerce(autoTriggerMode) ==
+            AutoTriggerModeOptions.CLASSIFIER.value
+
+    /** Suppressions for [modelId], or empty if none stored. */
+    fun suppressionsFor(modelId: String): Map<String, Boolean> =
+        autoIdSuppressions[modelId] ?: emptyMap()
+
+    /**
+     * Set the current Auto Id model/language and remember them for [familyId].
+     * [alsoRemember] is merged first (e.g. the family being left).
+     */
+    fun withAutoIdFamilySelection(
+        familyId: String,
+        modelId: String,
+        language: Int,
+        alsoRemember: Map<String, AutoIdFamilyPref> = emptyMap(),
+    ): Settings {
+        val remembered = autoIdFamilyPrefs + alsoRemember +
+            (familyId to AutoIdFamilyPref(modelId, language))
+        return copy(
+            autoIdModelId = modelId,
+            autoIdLanguage = language,
+            autoIdFamilyPrefs = remembered,
+        )
+    }
+
+    /**
+     * Ensure every key in [defaults] exists for [modelId], filling missing
+     * entries from [defaults] (typically `disable_by_default` from the labels JSON).
+     * Existing keys are left unchanged. Returns true if the map was modified.
+     */
+    fun mergeAutoIdSuppressionDefaults(
+        modelId: String,
+        defaults: Map<String, Boolean>,
+    ): Boolean {
+        if (defaults.isEmpty()) return false
+        val current = suppressionsFor(modelId).toMutableMap()
+        var changed = false
+        for ((key, value) in defaults) {
+            if (key !in current) {
+                current[key] = value
+                changed = true
+            }
+        }
+        if (changed) {
+            autoIdSuppressions = autoIdSuppressions + (modelId to current)
+        }
+        return changed
     }
 
     private val keyUseDarkTheme = booleanPreferencesKey("useDarkTheme")
@@ -487,9 +770,11 @@ data class Settings(
     private val keyPostTriggerTimeMs = intPreferencesKey("postTriggerTimeMs")
     private val keyMaxFileTimeMs = intPreferencesKey("maxFileTimeMs")
     private val keyUnlimitedFileLength = booleanPreferencesKey("unlimitedFileLength")
+    private val keyWavStorageVolume = stringPreferencesKey("wavStorageVolume")
     private val keyAutoTriggerThresholdDb = floatPreferencesKey("autoTriggerThresholdDb")
     private val keyAutoTriggerRangeStartkHz = floatPreferencesKey("autoTriggerRangeStartkHz")
     private val keyAutoTriggerRangeEndkHz = floatPreferencesKey("autoTriggerRangeEndkHz")
+    private val keyAutoTriggerMode = intPreferencesKey("autoTriggerMode")
     private val keyLoopedAudioPlayback = booleanPreferencesKey("loopedAudioPlayback")
     private val keyAudioOutputDeviceId = stringPreferencesKey("audioOutputDeviceId")
     private val keySuppressAudioFeedbackWarning = booleanPreferencesKey("suppressAudioFeedbackWarning")
@@ -498,6 +783,13 @@ data class Settings(
     private val keyAutoHeterodyneMode = intPreferencesKey("autoHeterodyneMode")
     private val keyAutoHeterodyneLoMinKhz = intPreferencesKey("autoHeterodyneLoMinKhz")
     private val keyAutoHeterodyneLoMaxKhz = intPreferencesKey("autoHeterodyneLoMaxKhz")
+    private val keyAutoId = booleanPreferencesKey("autoId")
+    private val keyMlModelId = stringPreferencesKey("autoIdModelId")
+    private val keyAutoIdLanguage = intPreferencesKey("autoIdLanguageIndex")
+    private val keyAutoIdFamilyPrefs = stringPreferencesKey("autoIdFamilyPrefs")
+    private val keyAutoIdSuppressions = stringPreferencesKey("autoIdSuppressions")
+    /** Legacy flat suppressions key; read for migration only. */
+    private val keyBbnSuppresions = stringPreferencesKey("bbnSuppresions")
 
 
     fun copyToPreferences(prefs: MutablePreferences) {
@@ -538,9 +830,11 @@ data class Settings(
         prefs[keyPostTriggerTimeMs] = postTriggerTimeMs
         prefs[keyMaxFileTimeMs] = maxFileTimeMs
         prefs[keyUnlimitedFileLength] = unlimitedFileLength
+        prefs[keyWavStorageVolume] = wavStorageVolume
         prefs[keyAutoTriggerThresholdDb] = autoTriggerThresholdDb
         prefs[keyAutoTriggerRangeStartkHz] = autoTriggerRangeMinkHz
         prefs[keyAutoTriggerRangeEndkHz] = autoTriggerRangeMaxkHz
+        prefs[keyAutoTriggerMode] = AutoTriggerModeOptions.coerce(autoTriggerMode)
         prefs[keyLoopedAudioPlayback] = loopedAudioPlayback
         prefs[keyAudioOutputDeviceId] = audioOutputDeviceId
         prefs[keySuppressAudioFeedbackWarning] = suppressAudioFeedbackWarning
@@ -552,6 +846,11 @@ data class Settings(
         autoHeterodyneLoMaxKhz = loMaxKhz
         prefs[keyAutoHeterodyneLoMinKhz] = loMinKhz
         prefs[keyAutoHeterodyneLoMaxKhz] = loMaxKhz
+        prefs[keyAutoId] = autoIdEnabled
+        prefs[keyMlModelId] = autoIdModelId
+        prefs[keyAutoIdLanguage] = autoIdLanguage
+        prefs[keyAutoIdFamilyPrefs] = autoIdFamilyPrefsToJson(autoIdFamilyPrefs)
+        prefs[keyAutoIdSuppressions] = autoIdSuppressionsToJson(autoIdSuppressions)
     }
 
     fun copyFromPreferences(prefs: Preferences) {
@@ -633,12 +932,17 @@ data class Settings(
             maxFileTimeMs = requireNotNull(prefs[keyMaxFileTimeMs])
         if (prefs[keyUnlimitedFileLength] != null)
             unlimitedFileLength = requireNotNull(prefs[keyUnlimitedFileLength])
+        if (prefs[keyWavStorageVolume] != null)
+            wavStorageVolume = requireNotNull(prefs[keyWavStorageVolume])
         if (prefs[keyAutoTriggerThresholdDb] != null)
             autoTriggerThresholdDb = requireNotNull(prefs[keyAutoTriggerThresholdDb])
         if (prefs[keyAutoTriggerRangeStartkHz] != null)
             autoTriggerRangeMinkHz = requireNotNull(prefs[keyAutoTriggerRangeStartkHz])
         if (prefs[keyAutoTriggerRangeEndkHz] != null)
             autoTriggerRangeMaxkHz = requireNotNull(prefs[keyAutoTriggerRangeEndkHz])
+        if (prefs[keyAutoTriggerMode] != null)
+            autoTriggerMode =
+                AutoTriggerModeOptions.coerce(requireNotNull(prefs[keyAutoTriggerMode]))
         if (prefs[keyLoopedAudioPlayback] != null)
             loopedAudioPlayback = requireNotNull(prefs[keyLoopedAudioPlayback])
         if (prefs[keyAudioOutputDeviceId] != null)
@@ -656,6 +960,35 @@ data class Settings(
             autoHeterodyneLoMinKhz = requireNotNull(prefs[keyAutoHeterodyneLoMinKhz])
         if (prefs[keyAutoHeterodyneLoMaxKhz] != null)
             autoHeterodyneLoMaxKhz = requireNotNull(prefs[keyAutoHeterodyneLoMaxKhz])
+        if (prefs[keyMlModelId] != null)
+            autoIdModelId = requireNotNull(prefs[keyMlModelId])
+        if (prefs[keyAutoId] != null) {
+            autoIdEnabled = requireNotNull(prefs[keyAutoId])
+        } else {
+            // Migrate from model-id-as-enable: blank meant off.
+            autoIdEnabled = autoIdModelId.isNotBlank()
+        }
+        // Always keep a concrete model id so re-enabling restores a selection.
+        if (autoIdModelId.isBlank()) {
+            autoIdModelId = DEFAULT_AUTO_ID_MODEL_ID
+        }
+        if (prefs[keyAutoIdLanguage] != null)
+            autoIdLanguage = requireNotNull(prefs[keyAutoIdLanguage])
+        if (prefs[keyAutoIdFamilyPrefs] != null) {
+            autoIdFamilyPrefs =
+                autoIdFamilyPrefsFromJson(requireNotNull(prefs[keyAutoIdFamilyPrefs]))
+        }
+        when {
+            prefs[keyAutoIdSuppressions] != null ->
+                autoIdSuppressions =
+                    autoIdSuppressionsFromJson(requireNotNull(prefs[keyAutoIdSuppressions]))
+            prefs[keyBbnSuppresions] != null ->
+                // Migrate legacy flat BattyBirdNET suppressions.
+                autoIdSuppressions = mapOf(
+                    DEFAULT_AUTO_ID_MODEL_ID to
+                        labelSuppressionsFromJson(requireNotNull(prefs[keyBbnSuppresions]))
+                )
+        }
         val (loMinKhz, loMaxKhz) = normalizedAutoHeterodyneLoRange()
         autoHeterodyneLoMinKhz = loMinKhz
         autoHeterodyneLoMaxKhz = loMaxKhz

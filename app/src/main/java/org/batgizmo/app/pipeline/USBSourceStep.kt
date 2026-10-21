@@ -25,7 +25,6 @@ package org.batgizmo.app.pipeline
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import org.batgizmo.app.BitmapHolder
 import org.batgizmo.app.HORange
@@ -60,22 +59,61 @@ class USBSourceStep(
                 val calcs = safeParams.calcs
                 val rawDataCapacity = rangedRawDataBuffer.buffer.size - AbstractPipeline.CANARY_ENTRIES
 
+                /*
+                 * After a pipeline rebuild that preserves the raw buffer (e.g. rotation),
+                 * continue writing where we left off instead of restarting at the left.
+                 * When the visible region is already full the live path has wrapped, so
+                 * offsets correctly restart at 0 — same as steady-state wrap.
+                 */
+                val filled = rangedRawDataBuffer.assignedRange.exclusiveEnd
+                    .coerceIn(0, rawDataCapacity)
+                val visibleRawMax = (rawDataCapacity * model.timeVisibleRangeFlow.value.endInclusive)
+                    .toInt()
+                    .coerceIn(
+                        calcs.rawSliceEntries.coerceAtMost(rawDataCapacity),
+                        rawDataCapacity
+                    )
+                val resumePartial = filled > 0 && filled < visibleRawMax
+
+                val stride = (calcs.rawSliceEntries - calcs.rawSliceOverlap).coerceAtLeast(1)
+                val completedSlices = if (!resumePartial || filled < calcs.rawSliceEntries) {
+                    0
+                } else {
+                    1 + (filled - calcs.rawSliceEntries) / stride
+                }
+
                 // We need to populate raw data up to this index to be ready to submit the
                 // next slice:
-                var nextSliceEndIndexHO = calcs.rawSliceEntries
+                var nextSliceEndIndexHO = if (completedSlices == 0) {
+                    calcs.rawSliceEntries
+                } else {
+                    calcs.rawSliceEntries + completedSlices * stride
+                }
 
                 // The index to the next entry in the raw data buffer to populate:
-                var rawDataBufferOffset = 0
+                var rawDataBufferOffset = if (resumePartial) filled else 0
 
                 // The index to the next transformed data buffer entry to be written, which is also
                 // the count of values we have from the start of the buffer:
-                var transformedDataBufferOffset = 0
+                var transformedDataBufferOffset =
+                    (completedSlices * calcs.sliceTransformedTimeBucketCount)
+                        .coerceIn(0, calcs.transformedTimeBucketCount)
 
-                var totalCopiedCount = 0
+                var totalCopiedCount = if (resumePartial || filled >= visibleRawMax) filled else 0
+
+                if (resumePartial) {
+                    Timber.i(
+                        "USBSourceStep: resuming live write at raw=$rawDataBufferOffset " +
+                            "transformed=$transformedDataBufferOffset " +
+                            "(filled=$filled, visibleMax=$visibleRawMax)"
+                    )
+                }
 
                 // The for statement will check if a cancel is pending, and if so pass control
                 // to the finally block for cleanup and to prevent this job becoming a zombie:
                 for (bufferDescriptor in LiveDataBridge.renderingChannel) {
+                    maybeSubmitLiveAudioToMl(bufferDescriptor)
+
                     if (rawDataCapacity > 0) {
                         // Copy live data into rawDataBuffer with wrap:
                         val copiedCount = LiveDataCopy.copyIntoRingBuffer(
@@ -193,6 +231,36 @@ class USBSourceStep(
         }
     }
 
+    private fun maybeSubmitLiveAudioToMl(bufferDescriptor: LiveDataBridge.BufferDescriptor) {
+        if (!model.shouldSubmitLiveAudioToMl()) return
+        when (bufferDescriptor) {
+            is LiveDataBridge.BufferDescriptor.Heap ->
+                model.maybeSubmitLiveAudioToMl(
+                    bufferDescriptor.data,
+                    bufferDescriptor.offset,
+                    bufferDescriptor.samples,
+                    observedAtEpochSec = bufferDescriptor.observedAtEpochSec,
+                )
+
+            is LiveDataBridge.BufferDescriptor.Native -> {
+                val samples = bufferDescriptor.samples
+                if (samples <= 0) return
+                val scratch = ShortArray(samples)
+                val copied = LiveDataCopy.copyIntoLinearBuffer(
+                    bufferDescriptor,
+                    scratch,
+                    nativeUSB
+                )
+                model.maybeSubmitLiveAudioToMl(
+                    scratch,
+                    0,
+                    copied,
+                    observedAtEpochSec = bufferDescriptor.observedAtEpochSec,
+                )
+            }
+        }
+    }
+
     override fun start() {
         channelJob?.cancel()        // Paranoia.
         channelJob = createChannelJob()
@@ -202,13 +270,11 @@ class USBSourceStep(
      * Make sure underlying handles and resources are closed:
      */
     override suspend fun shutdown() {
-
-        // If we don't do this, it will continue for ever, zombie like.
-        // Signal to the job to finish and wait for it to avoid
-        // async native layer access to data that is about to be garbage
-        // collected:
-        channelJob?.cancelAndJoin()
-
+        // Cancel only — do not join while AbstractPipeline.mutex may be held by
+        // the caller (fullExecute → internalShutdown). The channel job can be
+        // blocked inside pipeline.sliceRender waiting on that same mutex, which
+        // would deadlock on cancelAndJoin.
+        channelJob?.cancel()
         channelJob = null
     }
 
@@ -216,8 +282,8 @@ class USBSourceStep(
 
         rangedRawDataBuffer.assignedRange = HORange.EMPTY
 
-        // The job that handles new data contains data that we need to reset:
-        channelJob?.cancelAndJoin()
+        // Same lock-order constraint as [shutdown]: cancel without joining.
+        channelJob?.cancel()
         channelJob = createChannelJob()
     }
 

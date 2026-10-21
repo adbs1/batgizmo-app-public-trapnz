@@ -54,6 +54,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import org.batgizmo.app.ml.BirdNetModel
+import org.batgizmo.app.ml.MlCatalog
+import org.batgizmo.app.ml.MlClient
+import org.batgizmo.app.ml.MlModelDescriptor
+import org.batgizmo.app.ml.MlOverflowPolicy
+import org.batgizmo.app.ml.MlSummaryAccumulator
+import org.batgizmo.app.ml.MlSummaryMode
 import org.batgizmo.app.pipeline.AbstractPipeline
 import org.batgizmo.app.pipeline.ColourMapStep
 import org.batgizmo.app.pipeline.FileViewerPipeline
@@ -74,6 +82,7 @@ import org.batgizmo.app.review.ReviewSession
 import org.batgizmo.app.ui.TopLevelUI
 import org.batgizmo.app.ui.TopLevelUI.AppMode
 import timber.log.Timber
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -99,13 +108,23 @@ object LiveDataBridge {
 
     sealed class BufferDescriptor {
         abstract val samples: Int
+        /** Unix-epoch seconds of the first sample in this buffer. */
+        abstract val observedAtEpochSec: Double
 
         /** Samples in a native URB buffer (USB live path). */
-        data class Native(val nativeAddress: Long, override val samples: Int) : BufferDescriptor()
+        data class Native(
+            val nativeAddress: Long,
+            override val samples: Int,
+            override val observedAtEpochSec: Double,
+        ) : BufferDescriptor()
 
         /** Samples in a Kotlin heap buffer (reserved for non-USB live sources). */
-        data class Heap(val data: ShortArray, val offset: Int, override val samples: Int) :
-            BufferDescriptor()
+        data class Heap(
+            val data: ShortArray,
+            val offset: Int,
+            override val samples: Int,
+            override val observedAtEpochSec: Double,
+        ) : BufferDescriptor()
     }
 
     // Provide finite capacity for buffering and decoupling.
@@ -133,7 +152,13 @@ object LiveDataBridge {
      */
     @JvmStatic
     fun onDataBufferReady(nativeAddress: Long, samples: Int) {
-        trySendToChannels(BufferDescriptor.Native(nativeAddress, samples))
+        trySendToChannels(
+            BufferDescriptor.Native(
+                nativeAddress,
+                samples,
+                System.currentTimeMillis() / 1000.0,
+            )
+        )
     }
 
     /**
@@ -145,7 +170,9 @@ object LiveDataBridge {
             return
         val copy = ShortArray(samples)
         source.copyInto(copy, destinationOffset = 0, startIndex = offset, endIndex = offset + samples)
-        trySendToChannels(BufferDescriptor.Heap(copy, 0, samples))
+        trySendToChannels(
+            BufferDescriptor.Heap(copy, 0, samples, System.currentTimeMillis() / 1000.0)
+        )
     }
 }
 
@@ -244,6 +271,7 @@ class UIModel(application: Application,
      */
     override fun onCleared() {
         Timber.d("onCleared() called")
+        mlSummaryAccumulator.close()
         super.onCleared()
 
         /*
@@ -285,6 +313,8 @@ class UIModel(application: Application,
         usbService.availableAudioOutputs()
 
     private suspend fun cleanupPartialLiveConnect(liveInputSource: LiveInputSource) {
+        liveMlAccepting = false
+        flushMlClientFinal()
         fileWriter?.shutdown()
         fileWriter = null
         pipeline?.shutdown()
@@ -292,6 +322,9 @@ class UIModel(application: Application,
         setConnectedLiveInputSource(null)
         liveInputSource.disconnect()
         activeLiveInputSource = null
+        synchronized(mlLock) {
+            clearMlClientLocked()
+        }
     }
 
     private suspend fun connectLiveInputAndBuildPipeline(
@@ -333,10 +366,11 @@ class UIModel(application: Application,
                 mutableDetailsTextFlow, result.sampleRate,
                 result.sampleRate * pps.dataPageTimeSpanS
             ) {
-                // This lambda is called if a trigger was detected in the live data.
+                // This lambda is called if an energy trigger was detected in the live data.
 
-                // Trigger a file write:
-                fileWriter?.trigger()
+                if (settings.isEnergyAutoTrigger()) {
+                    fileWriter?.trigger()
+                }
                 // Trigger the monitor lamp in the Settings UI:
                 triggerMonitorChannel.trySend(Unit)
             }
@@ -357,6 +391,11 @@ class UIModel(application: Application,
             )
 
             pipeline = p
+            rememberPipelineBuild(
+                fftParameters,
+                spectrogramSizeDp ?: defaultSize,
+                amplitudeSizeDp
+            )
             setConnectedLiveInputSource(liveInputSourceSetting)
 
             if (resetLiveVisibleRanges) {
@@ -381,6 +420,12 @@ class UIModel(application: Application,
                 onFileWriterError
             )
             fileWriter?.run()
+
+            if (settings.isAutoIdEnabled()) {
+                mlSummaryAccumulator.clear(MlSummaryMode.Live)
+                ensureMlClient(result.sampleRate, forceReset = true)
+                liveMlAccepting = true
+            }
 
             if (settings.autoBaselineEnabled) {
                 tryRestoreNoiseBaseline(p)
@@ -426,6 +471,9 @@ class UIModel(application: Application,
 
         fileWriter?.shutdown()
         fileWriter = null
+
+        liveMlAccepting = false
+        flushMlClientFinal()
 
         pipeline?.shutdown()
         pipeline = null
@@ -523,6 +571,56 @@ class UIModel(application: Application,
     private val mutableDetailsTextFlow = MutableStateFlow<String?>(null)
     val detailsTextFlow: StateFlow<String?> = mutableDetailsTextFlow.asStateFlow()
 
+    /**
+     * Running ML summary: unique labels with max confidence and last-seen time.
+     * Survives recomposition and configuration changes with the ViewModel.
+     */
+    private val mlSummaryAccumulator = MlSummaryAccumulator()
+    val mlSummaryFlow = mlSummaryAccumulator.summary
+    val mlSummaryModeFlow = mlSummaryAccumulator.mode
+
+    /** True while Auto Id is ingesting samples into incomplete chunks. */
+    private val mutableMlBufferingFlow = MutableStateFlow(false)
+    val mlBufferingFlow: StateFlow<Boolean> = mutableMlBufferingFlow.asStateFlow()
+    private var mlBufferingCollectJob: Job? = null
+
+    /** True while Auto Id has queued or in-flight processor work. */
+    private val mutableMlBusyFlow = MutableStateFlow(false)
+    val mlBusyFlow: StateFlow<Boolean> = mutableMlBusyFlow.asStateFlow()
+    private var mlBusyCollectJob: Job? = null
+
+    /**
+     * True when the Auto Id client will ingest audio at the current sample rate
+     * (at or above the model minimum). False when there is no client or the rate
+     * is too low.
+     */
+    private val mutableMlWillAcceptAudioFlow = MutableStateFlow(false)
+    val mlWillAcceptAudioFlow: StateFlow<Boolean> = mutableMlWillAcceptAudioFlow.asStateFlow()
+    private var mlWillAcceptAudioCollectJob: Job? = null
+
+    /** Live ML client for the current sample rate, or null when inactive. */
+    private var mlClient: MlClient? = null
+    private var mlClientSampleRateHz: Int? = null
+
+    /**
+     * Bumped in [clearMlClientLocked] so in-flight [MlClient] callbacks from a
+     * torn-down client cannot submit results after a model/session change.
+     */
+    private val mlResultGeneration = AtomicInteger(0)
+
+    /**
+     * Serializes [mlClient] mutate/submit so live [USBSourceStep] (no UIModel mutex) cannot
+     * race settings/close. Never take [mutex] while holding this lock.
+     */
+    private val mlLock = Any()
+
+    /**
+     * When true, live PCM from [USBSourceStep] may be submitted to [mlClient]. Cleared on
+     * pause / Auto Id off / close; set on live connect and resume when Auto Id is enabled.
+     */
+    @Volatile
+    private var liveMlAccepting = false
+
     private val audioProgressChannel = Channel<Int>(Channel.CONFLATED)
     val audioProgressFlow = audioProgressChannel.receiveAsFlow()
 
@@ -580,6 +678,57 @@ class UIModel(application: Application,
     // How long to wait for pane sizes to settle before rebuilding, long enough to absorb a
     // transient system relayout (e.g. the microphone privacy indicator appearing then leaving):
     private val sizeChangeDebounceMs = 1200L
+    // Cap how long file-open will wait for that quiet period (picker return can bounce a few times):
+    private val paneSizeSettleTimeoutMs = 4000L
+
+    /**
+     * After open/live pipeline build: record the FFT params and pane sizes actually used, and
+     * cancel any pending size-debounce job. Otherwise open can race with layout bounce:
+     * build on a mid-bounce size while [lastBuiltSpectrogramSizeDp] still matches the eventual
+     * settled size, so the debounce skips reload and a bad first render sticks.
+     */
+    private fun rememberPipelineBuild(
+        fftParameters: AbstractPipeline.FftParameters,
+        builtSpectrogramSizeDp: DpSize,
+        builtAmplitudeSizeDp: DpSize?
+    ) {
+        sizeChangeJob?.cancel()
+        sizeChangeJob = null
+        currentFftParameters = fftParameters
+        lastBuiltSpectrogramSizeDp = builtSpectrogramSizeDp
+        lastBuiltAmplitudeSizeDp = builtAmplitudeSizeDp
+    }
+
+    /**
+     * Wait until spectrogram/amplitude pane sizes have been unchanged for [sizeChangeDebounceMs]
+     * (same quiet period as bounce handling), or until [paneSizeSettleTimeoutMs] elapses.
+     * Used before opening a file after the document picker, when returning often triggers a
+     * layout bounce that would otherwise race the first render.
+     */
+    private suspend fun awaitPaneSizesSettled() {
+        val completed = withTimeoutOrNull(paneSizeSettleTimeoutMs) {
+            while (true) {
+                val (spec, amp) = mutex.withLock {
+                    Pair(spectrogramSizeDp, amplitudeSizeDp)
+                }
+                delay(sizeChangeDebounceMs)
+                val settled = mutex.withLock {
+                    spectrogramSizeDp != null &&
+                        spectrogramSizeDp == spec &&
+                        amplitudeSizeDp == amp
+                }
+                if (settled) {
+                    Timber.d("Pane sizes settled: $spec, $amp")
+                    return@withTimeoutOrNull true
+                }
+                Timber.d("Pane sizes still changing; waiting again")
+            }
+            @Suppress("UNREACHABLE_CODE")
+            false
+        }
+        if (completed != true)
+            Timber.w("Timed out waiting for pane sizes to settle; opening anyway")
+    }
 
     // Single global instance of the bitmap holder we will use for rendering the
     // spectrogram and amplitude:
@@ -677,6 +826,18 @@ class UIModel(application: Application,
         startupPrompts.noteLaunchedForFileView()
     }
 
+    private val mutableIncomingByomZip = MutableStateFlow<Uri?>(null)
+    /** Non-null when a BYOM zip was opened via VIEW / SEND and awaits import UI. */
+    val incomingByomZip: StateFlow<Uri?> = mutableIncomingByomZip.asStateFlow()
+
+    fun offerIncomingByomZip(uri: Uri) {
+        mutableIncomingByomZip.value = uri
+    }
+
+    fun consumeIncomingByomZip() {
+        mutableIncomingByomZip.value = null
+    }
+
     fun dismissHighRateMicOffer(suppressFurther: Boolean = false) {
         startupPrompts.dismissHighRateMicOffer(suppressFurther)
     }
@@ -738,6 +899,7 @@ class UIModel(application: Application,
     val locationTracker = LocationTracker(getApplication()) { it ->
         Timber.d("Location update received: ${it.latitude} ${it.longitude}")
         locationMutableFlow.value = it
+        maybeOfferBirdNetGeoSnapshot(it)
     }
 
     val documentHelper = DocumentHelper()
@@ -756,6 +918,8 @@ class UIModel(application: Application,
         colourMapHelper.initialize(settings.colourMap)
         startupPrompts.start()
 
+        mlSummaryAccumulator.start(viewModelScope)
+
         /**
          * Get the preference values from storage asynchronously. When the values arrive, they
          * will overwrite the default settings values. If the value is not present in storage,
@@ -766,11 +930,44 @@ class UIModel(application: Application,
         // Kick off reading the settings in a coroutine, which will therefore happen in a bit:
         viewModelScope.launch(Dispatchers.IO) {
             flow.collect { prefs ->
+                var persistMergedSuppressions = false
                 mutex.withLock {
                     settings.copyFromPreferences(prefs)
+                    if (settings.isAutoIdEnabled()) {
+                        val modelId = settings.autoIdModelId
+                        val descriptor = try {
+                            MlCatalog.ensureInitialized(getApplication())
+                            MlCatalog.resolveDescriptor(
+                                getApplication<Application>().assets,
+                                modelId,
+                            )
+                        } catch (e: Exception) {
+                            Timber.e(e, "Failed to resolve Auto Id model $modelId")
+                            null
+                        }
+                        if (descriptor != null && settings.autoIdModelId != descriptor.id) {
+                            settings.autoIdModelId = descriptor.id
+                            persistMergedSuppressions = true
+                        }
+                        val suppressionDefaults = descriptor
+                            ?.labelCatalog
+                            ?.filter { !it.discard }
+                            ?.associate { it.key to it.disableByDefault }
+                            .orEmpty()
+                        persistMergedSuppressions = persistMergedSuppressions ||
+                            settings.mergeAutoIdSuppressionDefaults(
+                                settings.autoIdModelId,
+                                suppressionDefaults,
+                            )
+                    }
                     if (colourMapHelper.apply(settings.colourMap)) {
                         pipeline?.fullRenderFromSource()
                         triggerBitblt()
+                    }
+                }
+                if (persistMergedSuppressions) {
+                    settingsDataStore.edit { editPrefs ->
+                        settings.copyToPreferences(editPrefs)
                     }
                 }
                 // Signal to the UI that the settings values are ready:
@@ -789,6 +986,16 @@ class UIModel(application: Application,
                 val liveInputSourceChanged =
                     updatedSettings.liveInputSource != settings.liveInputSource
                 val colourMapChanged = updatedSettings.colourMap != settings.colourMap
+                val wasAutoIdEnabled = settings.isAutoIdEnabled()
+                val nowAutoIdEnabled = updatedSettings.isAutoIdEnabled()
+                val autoIdEnabled = nowAutoIdEnabled && !wasAutoIdEnabled
+                val autoIdDisabled = !nowAutoIdEnabled && wasAutoIdEnabled
+                val autoIdModelChanged =
+                    updatedSettings.autoIdModelId != settings.autoIdModelId
+                val autoIdLanguageChanged =
+                    updatedSettings.autoIdLanguage != settings.autoIdLanguage
+                val autoIdSuppressionsChanged =
+                    updatedSettings.autoIdSuppressions != settings.autoIdSuppressions
                 settings = updatedSettings
                 if (liveInputSourceChanged) {
                     liveInputSourceOverrideSession = false
@@ -799,8 +1006,147 @@ class UIModel(application: Application,
                     pipeline?.fullRenderFromSource()
                     triggerBitblt()
                 }
+                if (autoIdEnabled || (nowAutoIdEnabled && autoIdModelChanged)) {
+                    if (autoIdModelChanged) {
+                        synchronized(mlLock) {
+                            clearMlClientLocked()
+                        }
+                        mlSummaryAccumulator.clear(MlSummaryMode.Live)
+                    }
+                    pipeline?.let { p ->
+                        when (p) {
+                            is FileViewerPipeline -> submitFilePageToMl(p)
+                            is LiveUSBPipeline -> {
+                                mlSummaryAccumulator.clear(MlSummaryMode.Live)
+                                ensureMlClient(p.sampleRateHz(), forceReset = true)
+                                liveMlAccepting = true
+                            }
+                            else -> {}
+                        }
+                    }
+                } else if (autoIdDisabled) {
+                    liveMlAccepting = false
+                    flushMlClientFinal()
+                    synchronized(mlLock) {
+                        clearMlClientLocked()
+                    }
+                    mlSummaryAccumulator.clear(MlSummaryMode.Live)
+                } else if (nowAutoIdEnabled &&
+                    (autoIdLanguageChanged || autoIdSuppressionsChanged)
+                ) {
+                    synchronized(mlLock) {
+                        mlClient?.let { client ->
+                            client.setLabelLanguage(updatedSettings.autoIdLanguage)
+                            client.setSuppressions(
+                                updatedSettings.suppressionsFor(updatedSettings.autoIdModelId)
+                            )
+                        }
+                    }
+                    when (val p = pipeline) {
+                        is FileViewerPipeline -> submitFilePageToMl(p)
+                        else -> mlSummaryAccumulator.clear(MlSummaryMode.Live)
+                    }
+                }
             }
         }
+    }
+
+    /**
+     * Drop (and optionally recreate) the live Auto Id client so TFLite is
+     * reopened from disk. Required after BYOM replace of the same model id,
+     * and before deleting the active BYOM pack.
+     */
+    suspend fun reloadAutoIdClient(recreate: Boolean = true) {
+        withContext(Dispatchers.Default) {
+            synchronized(mlLock) {
+                clearMlClientLocked()
+            }
+            mlSummaryAccumulator.clear(MlSummaryMode.Live)
+            if (!recreate || !settings.isAutoIdEnabled()) return@withContext
+            when (val p = pipeline) {
+                is LiveUSBPipeline -> {
+                    liveMlAccepting = true
+                    ensureMlClient(p.sampleRateHz(), forceReset = true)
+                }
+                is FileViewerPipeline -> submitFilePageToMl(p)
+                else -> {}
+            }
+        }
+    }
+
+    /**
+     * Import a BYOM zip, select it, and force-reload TFLite (even when the
+     * model id is unchanged after an overwrite).
+     */
+    suspend fun importByomClassifier(
+        uri: Uri,
+        replaceExisting: Boolean,
+    ): MlModelDescriptor {
+        val app = getApplication<Application>()
+        val installed = withContext(Dispatchers.IO) {
+            MlCatalog.importByomZip(app, uri, replaceExisting = replaceExisting)
+        }
+        val defaults = installed.labelCatalog
+            .filter { !it.discard }
+            .associate { it.key to it.disableByDefault }
+        val language = settings.autoIdFamilyPrefs[installed.familyId]?.language
+            ?: settings.autoIdLanguage
+        val updated = settings.withAutoIdFamilySelection(
+            familyId = installed.familyId,
+            modelId = installed.id,
+            language = language,
+        )
+        updated.mergeAutoIdSuppressionDefaults(installed.id, defaults)
+        updateStoredSettings(updated)
+        // Same-id overwrite does not flip autoIdModelChanged; always remmap.
+        reloadAutoIdClient(recreate = true)
+        return installed
+    }
+
+    /**
+     * Remove an installed BYOM family. Tears down TFLite first when the active
+     * model belongs to that family, then selects a bundled fallback.
+     */
+    suspend fun removeByomClassifier(familyId: String): Boolean {
+        val app = getApplication<Application>()
+        val assets = app.assets
+        val removedModelIds = MlCatalog.listDescriptors(assets)
+            .filter { it.familyId == familyId }
+            .map { it.id }
+            .toSet()
+        val removingActive = settings.autoIdModelId in removedModelIds
+        if (removingActive) {
+            reloadAutoIdClient(recreate = false)
+        }
+        val removed = withContext(Dispatchers.IO) {
+            MlCatalog.removeByomFamily(app, familyId)
+        }
+        if (!removed) return false
+        val nested = settings.autoIdSuppressions.filterKeys { it !in removedModelIds }
+        val prefsWithout = settings.autoIdFamilyPrefs - familyId
+        val fallback = MlCatalog.resolveDescriptor(assets, null)
+        val remaining = MlCatalog.listDescriptors(assets)
+        val remembered = prefsWithout[fallback.familyId]
+        val modelId = remembered?.variantId
+            ?.takeIf { id -> remaining.any { it.id == id } }
+            ?: fallback.id
+        val chosen = remaining.firstOrNull { it.id == modelId } ?: fallback
+        val language = remembered?.language
+            ?.takeIf { chosen.languages.isEmpty() || it in chosen.languages.indices }
+            ?: settings.autoIdLanguage
+        val updated = settings.copy(
+            autoIdModelId = chosen.id,
+            autoIdLanguage = language,
+            autoIdFamilyPrefs = prefsWithout +
+                (chosen.familyId to AutoIdFamilyPref(chosen.id, language)),
+            autoIdSuppressions = nested,
+        )
+        val defaults = fallback.labelCatalog
+            .filter { !it.discard }
+            .associate { it.key to it.disableByDefault }
+        updated.mergeAutoIdSuppressionDefaults(fallback.id, defaults)
+        updateStoredSettings(updated)
+        return true
     }
 
     val oomMessage = "Your device has insufficient free memory for rendering spectrograms of this size.\n\n"+
@@ -818,13 +1164,22 @@ class UIModel(application: Application,
      *
      * This method leaves the file open if it is successful, so that data can be read from it.
      * It can be closes by calling reset().
+     *
+     * @param waitForPaneSizesToSettle if true, wait for spectrogram pane sizes to stop changing
+     *   (layout bounce after the document picker) before building the pipeline. Not needed for
+     *   next/previous within an already-stable viewer layout.
      */
-    fun openFile(uri: Uri, filename: String) {
+    fun openFile(uri: Uri, filename: String, waitForPaneSizesToSettle: Boolean = false) {
         val context: Context = getApplication()
 
         val model = this
         var result: OpenWavFileResult? = null
         viewModelScope.launch(Dispatchers.Default + CoroutineName("openFile coroutine")) {
+
+            if (waitForPaneSizesToSettle) {
+                Timber.d("openFile: waiting for pane sizes to settle ($filename)")
+                awaitPaneSizesSettled()
+            }
 
             // Allow any previous pipeline async cleanup to complete before we create a new one,
             // to avoid overlap and races:
@@ -834,6 +1189,9 @@ class UIModel(application: Application,
             mutex.withLock {
                 try {
                     Timber.d("openFile called for $filename")
+
+                    // Drop any prior Auto Id work before tearing down the old pipeline.
+                    discardQueuedMlWork(MlSummaryMode.Viewer)
 
                     // Take a snapshot of the parameters used to build this pipeline.
                     val pps = settings.pipelineParameters.copy()
@@ -861,9 +1219,10 @@ class UIModel(application: Application,
                         wfi.numChannels.toInt(), wfi.bytesPerValue * 8
                     )
                     // Assume square if we don't know yet:
+                    val builtSpectrogramSizeDp = spectrogramSizeDp ?: DpSize(100.dp, 100.dp)
                     val fftParameters = p.getDefaultFftParameters(
                         wfi.sampleRate,
-                        spectrogramSizeDp ?: DpSize(100.dp, 100.dp)
+                        builtSpectrogramSizeDp
                     )
 
                     // Do a full render from file:
@@ -873,6 +1232,13 @@ class UIModel(application: Application,
                     )
 
                     pipeline = p
+                    // Align last-built sizes with this render so a bounce that settles to a
+                    // different size still reloads, instead of skipping as a no-op bounce:
+                    rememberPipelineBuild(
+                        fftParameters,
+                        builtSpectrogramSizeDp,
+                        amplitudeSizeDp
+                    )
                     wavFileInfo.set(wfi)
                     reviewSession.enrichFromOpen(uri, wfi)
                     // This has a side affect of updating the axis ranges in the UI:
@@ -881,6 +1247,8 @@ class UIModel(application: Application,
                     internalDoColourMappingAndRender(
                         settings.autoBnCEnabledViewer,
                         settings.autoBaselineEnabled)
+
+                    submitFilePageToMl(p)
 
                     // Signal to the UI that we have successfully opened the file and initialized
                     // the pipeline:
@@ -1153,67 +1521,70 @@ class UIModel(application: Application,
             Timber.d("startAudio called")
 
             mutex.withLock {
-                val sampleRateHz = requireNotNull(pipeline?.sampleRateHz()) {
-                    "Pipeline sample rate required for live audio"
-                }
-                val playbackMode = settings.effectiveAudioPlaybackMode(sampleRateHz)
-                val modeFactor =
-                    if (playbackMode == Settings.AudioPlaybackModeOptions.TIME_EXPANSION.value)
-                        Settings.AudioTimeExpansionFactorOptions.coerce(
-                            settings.audioTimeExpansionFactor
-                        )
-                    else
-                        Settings.AudioPitchRatioOptions.coerceForSampleRate(
-                            settings.audioPitchRatio, sampleRateHz
-                        )
-                val isAutoHet = settings.isAutoTunedHeterodynePlayback(sampleRateHz)
-                if (isAutoHet)
-                    autoHeterodyne.resetTracker()
-                val heterodyne1kHz =
-                    if (isAutoHet) autoHeterodyne.initialRefkHz()
-                    else settings.coerceHeterodyneRefkHz(settings.heterodyneRef1kHz)
-                val heterodyne2kHz =
-                    if (playbackMode == Settings.AudioPlaybackModeOptions.DUAL_HETERODYNE.value)
-                        settings.coerceHeterodyneRefkHz(settings.heterodyneRef2kHz)
-                    else
-                        null
+                val sampleRateHz = pipeline?.sampleRateHz()
+                if (sampleRateHz == null) {
+                    Timber.w("startLiveAudio: no live pipeline; audio not started")
+                    audioStartResult = LiveAudioStartResult(startedOK = false)
+                } else {
+                    val playbackMode = settings.effectiveAudioPlaybackMode(sampleRateHz)
+                    val modeFactor =
+                        if (playbackMode == Settings.AudioPlaybackModeOptions.TIME_EXPANSION.value)
+                            Settings.AudioTimeExpansionFactorOptions.coerce(
+                                settings.audioTimeExpansionFactor
+                            )
+                        else
+                            Settings.AudioPitchRatioOptions.coerceForSampleRate(
+                                settings.audioPitchRatio, sampleRateHz
+                            )
+                    val isAutoHet = settings.isAutoTunedHeterodynePlayback(sampleRateHz)
+                    if (isAutoHet)
+                        autoHeterodyne.resetTracker()
+                    val heterodyne1kHz =
+                        if (isAutoHet) autoHeterodyne.initialRefkHz()
+                        else settings.coerceHeterodyneRefkHz(settings.heterodyneRef1kHz)
+                    val heterodyne2kHz =
+                        if (playbackMode == Settings.AudioPlaybackModeOptions.DUAL_HETERODYNE.value)
+                            settings.coerceHeterodyneRefkHz(settings.heterodyneRef2kHz)
+                        else
+                            null
 
-                when (effectiveLiveInputSource()) {
-                    Settings.LiveInputSourceOptions.USB.value -> {
-                        usbService.startAudio(
-                            heterodyne1kHz,
-                            heterodyne2kHz,
-                            settings.audioBoostFactor,
-                            playbackMode,
-                            modeFactor,
-                            settings.audioPitchHpfEnabled
-                        )
-                        audioOutputActive = true
-                        if (isAutoHet)
-                            autoHeterodyne.setDisplayedRefkHz(heterodyne1kHz)
-                        audioStartResult = LiveAudioStartResult(startedOK = true)
-                    }
+                    when (effectiveLiveInputSource()) {
+                        Settings.LiveInputSourceOptions.USB.value -> {
+                            usbService.startAudio(
+                                heterodyne1kHz,
+                                heterodyne2kHz,
+                                settings.audioBoostFactor,
+                                playbackMode,
+                                modeFactor,
+                                settings.audioPitchHpfEnabled
+                            )
+                            audioOutputActive = true
+                            if (isAutoHet)
+                                autoHeterodyne.setDisplayedRefkHz(heterodyne1kHz)
+                            audioStartResult = LiveAudioStartResult(startedOK = true)
+                        }
 
-                    Settings.LiveInputSourceOptions.PHONE_MIC.value -> {
-                        val started = usbService.startLiveInputAudio(
-                            sampleRateHz,
-                            heterodyne1kHz,
-                            heterodyne2kHz,
-                            settings.audioBoostFactor,
-                            playbackMode,
-                            modeFactor,
-                            settings.audioPitchHpfEnabled
-                        )
-                        micCaptureService.liveAudioMonitorEnabled = started
-                        audioOutputActive = started
-                        if (started && isAutoHet)
-                            autoHeterodyne.setDisplayedRefkHz(heterodyne1kHz)
-                        audioStartResult = LiveAudioStartResult(startedOK = started)
-                    }
+                        Settings.LiveInputSourceOptions.PHONE_MIC.value -> {
+                            val started = usbService.startLiveInputAudio(
+                                sampleRateHz,
+                                heterodyne1kHz,
+                                heterodyne2kHz,
+                                settings.audioBoostFactor,
+                                playbackMode,
+                                modeFactor,
+                                settings.audioPitchHpfEnabled
+                            )
+                            micCaptureService.liveAudioMonitorEnabled = started
+                            audioOutputActive = started
+                            if (started && isAutoHet)
+                                autoHeterodyne.setDisplayedRefkHz(heterodyne1kHz)
+                            audioStartResult = LiveAudioStartResult(startedOK = started)
+                        }
 
-                    else -> {
-                        Timber.w("Live audio monitor is not available for this input source")
-                        audioStartResult = LiveAudioStartResult(startedOK = false)
+                        else -> {
+                            Timber.w("Live audio monitor is not available for this input source")
+                            audioStartResult = LiveAudioStartResult(startedOK = false)
+                        }
                     }
                 }
             }
@@ -1354,6 +1725,9 @@ class UIModel(application: Application,
         viewModelScope.launch(Dispatchers.Default + CoroutineName("openLive coroutine")) {
             mutex.withLock {
                 activeLiveInputSource?.pause()
+                // End the current ML stream; resume will reset and accept again.
+                liveMlAccepting = false
+                flushMlClientFinal()
             }
         }
     }
@@ -1454,6 +1828,12 @@ class UIModel(application: Application,
                     if (!sourceChanged) {
                         activeLiveInputSource?.resume()
                     }
+
+                    if (settings.isAutoIdEnabled()) {
+                        mlSummaryAccumulator.clear(MlSummaryMode.Live)
+                        ensureMlClient(p.sampleRateHz(), forceReset = true)
+                        liveMlAccepting = true
+                    }
                 }
             }
 
@@ -1486,6 +1866,11 @@ class UIModel(application: Application,
 
     suspend fun internalClosePipeline() {
 
+        // Stop Auto Id and abandon any waiting work (do not flush — close should not
+        // keep analysing after the user leaves the viewer/live session).
+        liveMlAccepting = false
+        discardQueuedMlWork(MlSummaryMode.Live)
+
         // Finish with the file writer:
         fileWriter?.shutdown()
         fileWriter = null
@@ -1503,10 +1888,317 @@ class UIModel(application: Application,
         wavFileInfo.set(null)
 
         mutableDetailsTextFlow.value = null
+        synchronized(mlLock) {
+            clearMlClientLocked()
+            // Drop results already delivered but not yet merged, then clear summary again
+            // so an in-flight chunk cannot repopulate the panel after close.
+            mlSummaryAccumulator.clear(MlSummaryMode.Live)
+        }
         mutableMicrophoneVolumeParametersFlow.value = null
         mutableMicrophoneGainFlow.value = null
 
         resetRanges()
+    }
+
+    /** Caller must hold [mlLock]. */
+    private fun clearMlClientLocked() {
+        mlBufferingCollectJob?.cancel()
+        mlBufferingCollectJob = null
+        mutableMlBufferingFlow.value = false
+        mlBusyCollectJob?.cancel()
+        mlBusyCollectJob = null
+        mutableMlBusyFlow.value = false
+        mlWillAcceptAudioCollectJob?.cancel()
+        mlWillAcceptAudioCollectJob = null
+        mutableMlWillAcceptAudioFlow.value = false
+        mlResultGeneration.incrementAndGet()
+        mlClient?.shutdown()
+        mlClient = null
+        mlClientSampleRateHz = null
+    }
+
+    /** Caller must hold [mlLock]. Collect ingest/busy signals into UI flows. */
+    private fun attachMlActivityCollectorsLocked(client: MlClient) {
+        mlBufferingCollectJob?.cancel()
+        mlBufferingCollectJob = viewModelScope.launch {
+            client.isBuffering.collect { buffering ->
+                mutableMlBufferingFlow.value = buffering
+            }
+        }
+        mlBusyCollectJob?.cancel()
+        mlBusyCollectJob = viewModelScope.launch {
+            client.isBusy.collect { busy ->
+                mutableMlBusyFlow.value = busy
+            }
+        }
+        mlWillAcceptAudioCollectJob?.cancel()
+        mlWillAcceptAudioCollectJob = viewModelScope.launch {
+            client.willAcceptAudioFlow.collect { accepts ->
+                mutableMlWillAcceptAudioFlow.value = accepts
+                // Drop on-screen hits when the model cannot use this sample rate
+                // (or after client teardown). Otherwise rows from the previous
+                // model linger after switching to an inapplicable one.
+                if (!accepts) {
+                    mlSummaryAccumulator.clear(mlSummaryModeFlow.value)
+                }
+            }
+        }
+    }
+
+    /**
+     * Ensure an [MlClient] exists and has been [MlClient.reset] for [sampleRateHz].
+     * Results are queued and merged into [mlSummaryFlow].
+     *
+     * @param forceReset if true, always [MlClient.reset] even when the rate is unchanged
+     *   (e.g. starting analysis of a new file page).
+     * @param overflowPolicy live [MlOverflowPolicy.DropIfFull] vs viewer [MlOverflowPolicy.QueueAll]
+     * @param summaryMode Auto Id summary TTL policy applied when the client is reset
+     * @param preferFileGuanoLocation when true (viewer), use GUANO `Loc Position` if
+     *   present, otherwise [locationFlow]; when false (live), use [locationFlow] only
+     */
+    fun ensureMlClient(
+        sampleRateHz: Int,
+        forceReset: Boolean = false,
+        overflowPolicy: MlOverflowPolicy = MlOverflowPolicy.DropIfFull,
+        summaryMode: MlSummaryMode = MlSummaryMode.Live,
+        preferFileGuanoLocation: Boolean = false,
+    ) {
+        require(sampleRateHz > 0) { "sampleRateHz must be > 0" }
+        require(settings.isAutoIdEnabled()) { "Auto Id must be enabled" }
+        synchronized(mlLock) {
+            val modelId = settings.autoIdModelId
+            val existing = mlClient
+            if (existing != null && existing.modelId != modelId) {
+                clearMlClientLocked()
+            }
+            MlCatalog.ensureInitialized(getApplication())
+            val descriptor = MlCatalog.resolveDescriptor(
+                getApplication<Application>().assets,
+                modelId,
+            )
+            if (settings.autoIdModelId != descriptor.id) {
+                settings.autoIdModelId = descriptor.id
+            }
+            val client = mlClient ?: run {
+                val generation = mlResultGeneration.get()
+                MlClient(
+                    getApplication(),
+                    descriptor.id,
+                    descriptor,
+                ) { result ->
+                    // Drop late results from a previous client (model switch /
+                    // teardown) and any results while this rate is rejected.
+                    if (generation == mlResultGeneration.get() &&
+                        mutableMlWillAcceptAudioFlow.value
+                    ) {
+                        mlSummaryAccumulator.submitResult(result)
+                        if (result.detections.isNotEmpty()) {
+                            // Always record detections for GUANO Species Auto ID when
+                            // Auto Id is producing hits (any trigger mode).
+                            fileWriter?.noteClassifierDetections(
+                                result.observedAtEpochSec,
+                                result.detections,
+                            )
+                            if (settings.isClassifierAutoTrigger()) {
+                                val top = result.detections.first()
+                                val windowSec = Settings.classifierWindowDurationSec(
+                                    descriptor.windowSamples,
+                                    descriptor.sampleRateHz,
+                                ) ?: Settings.CLASSIFIER_WINDOW_FALLBACK_SEC
+                                val windowEnd = result.observedAtEpochSec + windowSec
+                                Timber.i(
+                                    "CLF_REC_DBG classifier window %s → %s (%d detection(s))",
+                                    FileWriter.wallClock(result.observedAtEpochSec),
+                                    FileWriter.wallClock(windowEnd),
+                                    result.detections.size,
+                                )
+                                fileWriter?.triggerClassifier(
+                                    result.observedAtEpochSec,
+                                    top.labelKey,
+                                )
+                            }
+                        }
+                    }
+                }.also {
+                    mlClient = it
+                    attachMlActivityCollectorsLocked(it)
+                }
+            }
+            client.setOverflowPolicy(overflowPolicy)
+            client.setLabelLanguage(settings.autoIdLanguage)
+            client.setSuppressions(settings.suppressionsFor(descriptor.id))
+            if (descriptor.resourcePaths.geoModelRelativeOrNull != null) {
+                if (forceReset) {
+                    client.clearGeoSnapshot()
+                }
+                resolveAutoIdGeoSnapshot(preferFileGuanoLocation)?.let { snap ->
+                    client.setGeoSnapshot(snap)
+                }
+            }
+            if (forceReset || mlClientSampleRateHz != sampleRateHz) {
+                client.reset(sampleRateHz)
+                mlClientSampleRateHz = sampleRateHz
+                mlSummaryAccumulator.clear(summaryMode)
+            }
+        }
+    }
+
+    /**
+     * BirdNET geo query: optionally GUANO `Loc Position` from the open file, else
+     * the current [locationFlow] fix. Returns null if neither is available.
+     */
+    private fun resolveAutoIdGeoSnapshot(
+        preferFileGuano: Boolean,
+    ): BirdNetModel.GeoSnapshot? {
+        val week = BirdNetModel.weekOfYear()
+        if (preferFileGuano) {
+            parseGuanoLocPosition()?.let { (lat, lon) ->
+                return BirdNetModel.GeoSnapshot(
+                    latitude = lat,
+                    longitude = lon,
+                    week = week,
+                    source = BirdNetModel.GeoSource.GUANO,
+                )
+            }
+        }
+        val loc = locationMutableFlow.value ?: return null
+        return BirdNetModel.GeoSnapshot(
+            latitude = loc.latitude.toFloat(),
+            longitude = loc.longitude.toFloat(),
+            week = week,
+            source = BirdNetModel.GeoSource.LIVE_GPS,
+        )
+    }
+
+    /**
+     * Parse GUANO `Loc Position` as `latitude longitude` (same order as
+     * [FileWriter]). Returns null if missing or invalid.
+     */
+    private fun parseGuanoLocPosition(): Pair<Float, Float>? {
+        val raw = wavFileInfo.get()
+            ?.guanoChunkInfo
+            ?.entriesMap
+            ?.get("loc position")
+            ?.value
+            ?: return null
+        val parts = raw.trim().split(Regex("\\s+"))
+        if (parts.size < 2) return null
+        val lat = parts[0].toFloatOrNull() ?: return null
+        val lon = parts[1].toFloatOrNull() ?: return null
+        if (lat !in -90f..90f || lon !in -180f..180f) return null
+        return lat to lon
+    }
+
+    /** Current ML client, if [ensureMlClient] has been called. */
+    fun mlClientOrNull(): MlClient? = synchronized(mlLock) { mlClient }
+
+    /**
+     * Offer a one-shot BirdNET geo snapshot from [location] if an Auto Id client
+     * is active. Ignored after the first accepted snapshot.
+     */
+    private fun maybeOfferBirdNetGeoSnapshot(location: Location) {
+        synchronized(mlLock) {
+            val client = mlClient ?: return
+            client.setGeoSnapshot(
+                BirdNetModel.GeoSnapshot(
+                    latitude = location.latitude.toFloat(),
+                    longitude = location.longitude.toFloat(),
+                    week = BirdNetModel.weekOfYear(),
+                    source = BirdNetModel.GeoSource.LIVE_GPS,
+                )
+            )
+        }
+    }
+
+    /** True when live Auto Id should accept the next raw buffer. */
+    fun shouldSubmitLiveAudioToMl(): Boolean =
+        settings.isAutoIdEnabled() && liveMlAccepting
+
+    /**
+     * Cheap path from [USBSourceStep]: submit samples to [MlClient] when Auto Id is
+     * accepting. Does not take [mutex].
+     */
+    fun maybeSubmitLiveAudioToMl(
+        buffer: ShortArray,
+        offset: Int,
+        count: Int,
+        observedAtEpochSec: Double = System.currentTimeMillis() / 1000.0,
+    ) {
+        if (!shouldSubmitLiveAudioToMl() || count <= 0) return
+        synchronized(mlLock) {
+            if (!shouldSubmitLiveAudioToMl()) return
+            mlClient?.submit(
+                buffer,
+                offset,
+                count,
+                observedAtEpochSec = observedAtEpochSec,
+                isLast = false,
+            )
+        }
+    }
+
+    /**
+     * Drop any waiting ML work and clear the on-screen summary.
+     * An in-flight chunk may still finish; new page submit uses [forceReset].
+     */
+    private fun discardQueuedMlWork(summaryMode: MlSummaryMode) {
+        mlSummaryAccumulator.clear(summaryMode)
+        synchronized(mlLock) {
+            mlClient?.clearQueue()
+        }
+    }
+
+    /**
+     * When Auto Id is enabled and [pipeline] is a file viewer with assigned raw PCM,
+     * reset the ML client and submit that page's samples.
+     *
+     * Intended for file open, left/right paging, and turning Auto Id on — not for
+     * zoom or other view-only reloads.
+     */
+    private fun submitFilePageToMl(pipeline: AbstractPipeline) {
+        if (!settings.isAutoIdEnabled()) return
+        if (pipeline !is FileViewerPipeline) return
+        val sampleRateHz = pipeline.sampleRateHz()
+        if (sampleRateHz <= 0) return
+        val (buffer, range) = pipeline.getAssignedRawDataBuffer() ?: return
+
+        discardQueuedMlWork(MlSummaryMode.Viewer)
+        ensureMlClient(
+            sampleRateHz,
+            forceReset = true,
+            overflowPolicy = MlOverflowPolicy.QueueAll,
+            summaryMode = MlSummaryMode.Viewer,
+            preferFileGuanoLocation = true,
+        )
+        val observedAtEpochSec = System.currentTimeMillis() / 1000.0
+        synchronized(mlLock) {
+            mlClient?.submit(
+                buffer,
+                range.start,
+                range.length,
+                observedAtEpochSec = observedAtEpochSec,
+                isLast = true,
+            )
+        }
+        Timber.d(
+            "Submitted file page to MlClient: ${range.length} samples at $sampleRateHz Hz " +
+                "(range $range)"
+        )
+    }
+
+    /** Pad/process any partial ML chunk ([MlClient.submit] with [isLast] true). */
+    private fun flushMlClientFinal() {
+        synchronized(mlLock) {
+            val client = mlClient ?: return
+            if (mlClientSampleRateHz == null) return
+            client.submit(
+                ShortArray(0),
+                0,
+                0,
+                observedAtEpochSec = System.currentTimeMillis() / 1000.0,
+                isLast = true,
+            )
+        }
     }
 
     private fun resetRanges() {
@@ -1733,12 +2425,16 @@ class UIModel(application: Application,
         pipeline?.let {
             viewModelScope.launch(Dispatchers.Default + CoroutineName("onRescale coroutine")) {
                 mutex.withLock {
+                    // Stop analysing the previous page immediately (reload can take a while).
+                    discardQueuedMlWork(MlSummaryMode.Viewer)
                     reload(
                         settings,
                         rawPageRange,
                         autoBnCRequiredFlow.value,
                         resetVisibleRange = true
                     )
+                    // New file page only: feed Auto Id (not on zoom/FFT-only reloads).
+                    pipeline?.let { p -> submitFilePageToMl(p) }
                 }
             }
         }
@@ -1903,8 +2599,10 @@ class UIModel(application: Application,
                     )
                 }
             } else {
+                val pageSamples =
+                    (pipelineParameters.dataPageTimeSpanS * sampleRate).toInt()
                 newFftParameters = AbstractPipeline.calculateFftParameters(
-                    pipelineParameters, screenFactors, sampleRate
+                    pipelineParameters, screenFactors, sampleRate, pageSamples
                 )
 
             }

@@ -27,11 +27,13 @@ import android.content.Context
 import android.content.res.Configuration
 import android.net.Uri
 import android.view.WindowManager
+import android.webkit.WebView
 import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.ManagedActivityResultLauncher
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -40,10 +42,8 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
-import android.webkit.WebView
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -53,7 +53,6 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.AccessTime
 import androidx.compose.material.icons.filled.Build
-import androidx.compose.material.icons.filled.WbTwilight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.FiberManualRecord
 import androidx.compose.material.icons.filled.Info
@@ -64,6 +63,8 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.ScreenLockRotation
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.WbTwilight
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.BottomAppBar
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -75,7 +76,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -97,7 +97,10 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -107,11 +110,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.vectorResource
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -129,7 +131,6 @@ import org.batgizmo.app.Settings
 import org.batgizmo.app.SunriseSunset
 import org.batgizmo.app.UIModel
 import org.batgizmo.app.diagnosticLogger
-import org.batgizmo.app.pipeline.AbstractPipeline
 import org.batgizmo.app.pipeline.LiveAudioStartResult
 import org.batgizmo.app.review.ReviewFlag
 import org.batgizmo.app.ui.TopLevelUI.AppMode
@@ -151,6 +152,28 @@ class SpectrogramUI(
     val localShowHeterodyneReferenceLine = compositionLocalOf<Boolean> { true }
     val localOverlayTextMode = compositionLocalOf<Int> {
         Settings.OverlayTextModeOptions.BASIC.value
+    }
+    val localAutoId = compositionLocalOf<Boolean> { false }
+
+    /**
+     * If classifier-auto is armed but Auto Id is off, uncheck the button and
+     * stop the writer. Returns true when it disarmed.
+     */
+    private fun disarmTriggeredRecordingIfClassifierNotReady(
+        classifierTrigger: Boolean,
+        autoIdEnabled: Boolean,
+    ): Boolean {
+        if (!classifierTrigger ||
+            !buttonState.triggeredRecordingChecked.value ||
+            autoIdEnabled
+        ) {
+            return false
+        }
+        buttonState.triggeredRecordingChecked.value = false
+        model.fileWriter?.configureTrigger(
+            FileWriter.TriggerConfig(triggerType = TriggerType.OFF)
+        )
+        return true
     }
 
     /**
@@ -234,7 +257,9 @@ class SpectrogramUI(
         val samplingRateHz: MutableState<Int?> = mutableStateOf(null),
         val dataPresent: MutableState<Boolean> = mutableStateOf(false),
         /** Bumped when auto-het axis highlight inputs change. */
-        val autoHetAxisHighlightKey: MutableIntState = mutableIntStateOf(0)
+        val autoHetAxisHighlightKey: MutableIntState = mutableIntStateOf(0),
+        val autoTriggerMode: MutableIntState =
+            mutableIntStateOf(Settings.AutoTriggerModeOptions.ENERGY.value),
     ) {
         fun isAudioPlaybackOn(): Boolean = audioMode.intValue == AudioMode.ON.value
 
@@ -588,7 +613,7 @@ class SpectrogramUI(
             ) {
                 // Box so that we can overlay things on the spectrogram:
                 Box {
-                    val title = rememberSaveable { uiState.title }
+                    val title = uiState.title
                     val detailsText = model.detailsTextFlow.collectAsStateWithLifecycle()
 
                     SpectrogramPaneSet(
@@ -596,9 +621,9 @@ class SpectrogramUI(
                         model = viewModel,
                         amplitudePaneVisibility = amplitudePaneVisibility,
                         title = title,
-                        { modifier: Modifier ->
+                        { modifier: Modifier, plotPadding: GraphBase.GraphPadding ->
                             ComposeOverlay(
-                                modifier, buttonState, detailsText, appMode
+                                modifier, buttonState, detailsText, appMode, plotPadding
                             )
                         }
                     )
@@ -749,7 +774,7 @@ class SpectrogramUI(
             if (micOptions.size > 1) {
                 // Real internal microphones are available, so let the user choose one.
                 MicSelectionDialog(
-                    title = "No USB microphone",
+                    title = "Internal Microphone",
                     message = "No suitable USB microphone was detected. " +
                         "Select an internal microphone to use instead.",
                     options = micOptions,
@@ -768,7 +793,7 @@ class SpectrogramUI(
                         uiState.showInternalMicFallbackDialog.value = false
                         liveSession.switchToInternalMicAndConnect(scope)
                     },
-                    title = "No USB microphone",
+                    title = "Internal Microphone",
                     message = "No suitable USB microphone was detected. " +
                         "Would you like to use the internal device microphone instead?",
                 )
@@ -841,130 +866,163 @@ class SpectrogramUI(
         modifier: Modifier,
         buttonState: ButtonState,
         detailsText: State<String?>,
-        appMode: MutableIntState
+        appMode: MutableIntState,
+        plotPadding: GraphBase.GraphPadding,
     ) {
-        // A box so we can have two layers.
-        Box(modifier = modifier
-            .fillMaxSize()) {
+        val currentlyWritingFile by model.currentlyWritingFlow.collectAsState()
+        val recordingArmed =
+            buttonState.triggeredRecordingChecked.value || buttonState.manualRecordingChecked.value
+        val showRecordingFrame =
+            uiState.liveMode.intValue == LiveMode.STREAMING.value && recordingArmed
+        val showRedRecordingFrame = showRecordingFrame && currentlyWritingFile
+        val redPulseAlpha = remember { Animatable(1f) }
+        LaunchedEffect(showRedRecordingFrame) {
+            if (showRedRecordingFrame) {
+                repeat(3) {
+                    redPulseAlpha.animateTo(0.2f, animationSpec = tween(300))
+                    redPulseAlpha.animateTo(1f, animationSpec = tween(300))
+                }
+                redPulseAlpha.snapTo(1f)
+            } else {
+                redPulseAlpha.snapTo(1f)
+            }
+        }
+        val liveStatusColour = when {
+            !showRecordingFrame -> null
+            currentlyWritingFile ->
+                manualRecordDotColour.copy(alpha = redPulseAlpha.value)
+            else ->
+                Color(0xFFB07020)   // Waiting for trigger / armed
+        }
+        val liveStatusFrame = if (liveStatusColour != null) {
+            Modifier.liveStatusEdgeFade(liveStatusColour)
+        } else {
+            Modifier
+        }
 
-            // Layer 1: static things:
-            Column(Modifier
+        // Chrome and status frame sit in the data area (inside axis/title borders).
+        Box(
+            modifier
                 .fillMaxSize()
-                .padding(5.dp)) {
+                .padding(
+                    start = maxOf(plotPadding.leftDp.dp, 0.dp),
+                    top = plotPadding.topDp.dp,
+                    end = plotPadding.rightDp.dp,
+                    bottom = plotPadding.bottomDp.dp + 0.5.dp
+                )
+                .then(liveStatusFrame)
+        ) {
 
-                val commonModifier = Modifier.fillMaxWidth()
-                val commonAlignment = Alignment.CenterVertically
-
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .padding(5.dp)
+            ) {
+                // (1) Auto Id sparkle | ML results | heterodyne references | close button
                 Row(
                     Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
+                    verticalAlignment = Alignment.Top
                 ) {
-                    Box(
-                        Modifier.fillMaxWidth()
-                    ) {
-                        Row(Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically) {
-
-                            val currentlyWritingFile by model.currentlyWritingFlow.collectAsState()
-
-                            val colour = when (uiState.liveMode.intValue) {
-                                LiveMode.OFF.value -> Color.Transparent
-                                LiveMode.CONNECTING.value -> Color.DarkGray
-                                LiveMode.STREAMING.value -> {
-                                    if (buttonState.triggeredRecordingChecked.value || buttonState.manualRecordingChecked.value) {
-                                        if (currentlyWritingFile) Color(0xFF8B0000) else Color(0xFFB07020)
-                                    }
-                                    else
-                                        Color(0xFF006400)           // Dark green
-                                }
-                                LiveMode.PAUSED.value -> Color.DarkGray
-                                else -> Color.Transparent           // Shouldn't get here.
-                            }
-
-                            if (uiState.liveMode.intValue != LiveMode.OFF.value) {
-                                MyLamp2(20.dp, colour)
-                            }
-
-                            Spacer(Modifier.weight(1f))
-
-                            if (uiState.fileIsOpen.value) {
-                                Column {
-                                    MyTransparentButton(
-                                        ImageVector.vectorResource(R.drawable.baseline_close_24),
-                                        "Close file", true
-                                    ) {
-                                        model.resetUIMode(AppMode.LIVE)
-                                    }
-                                }
-                            }
+                    if (localAutoId.current) {
+                        // Sparkle / results only while Auto Id has a session context and the
+                        // client will accept audio at the current sample rate.
+                        // Hidden after the viewer is closed (live with acquisition off),
+                        // or when the rate is below the model minimum.
+                        val mlWillAcceptAudio by
+                            model.mlWillAcceptAudioFlow.collectAsStateWithLifecycle()
+                        val showSparkle =
+                            mlWillAcceptAudio &&
+                                (appMode.intValue == AppMode.VIEWER.value ||
+                                    uiState.liveMode.intValue in setOf(
+                                        LiveMode.STREAMING.value,
+                                        LiveMode.PAUSED.value,
+                                    ))
+                        if (showSparkle) {
+                            val mlBuffering by model.mlBufferingFlow.collectAsStateWithLifecycle()
+                            val mlBusy by model.mlBusyFlow.collectAsStateWithLifecycle()
+                            // Viewer page ingest is brief; keep pulsing while the processor
+                            // still has queued/in-flight work from that submit.
+                            AutoIdSparkleIcon(active = mlBuffering || mlBusy)
                         }
 
-                        Row(Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically) {
-
+                        if (mlWillAcceptAudio) {
+                            val mlSummary by model.mlSummaryFlow.collectAsStateWithLifecycle()
+                            MlResultsPanel(
+                                modifier = Modifier.weight(1f),
+                                summary = mlSummary,
+                                ageColors = appMode.intValue == AppMode.LIVE.value,
+                            )
+                        } else {
                             Spacer(Modifier.weight(1f))
+                        }
+                    } else {
+                        Spacer(Modifier.weight(1f))
+                    }
 
-                            if (uiState.audioMode.intValue == AudioMode.ON.value) {
-                                Column {
-                                    uiState.heterodyneRef1kHz.value?.let {
-                                        Text("${uiState.heterodyneRef1kHz.value} kHz")
-                                    }
-                                    uiState.heterodyneRef2kHz.value?.let {
-                                        Text("${uiState.heterodyneRef2kHz.value} kHz")
-                                    }
-                                }
+                    if (uiState.audioMode.intValue == AudioMode.ON.value) {
+                        Column(
+                            modifier = Modifier.padding(horizontal = 8.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            uiState.heterodyneRef1kHz.value?.let {
+                                Text("${uiState.heterodyneRef1kHz.value} kHz")
                             }
+                            uiState.heterodyneRef2kHz.value?.let {
+                                Text("${uiState.heterodyneRef2kHz.value} kHz")
+                            }
+                        }
+                    }
 
-                            Spacer(Modifier.weight(1f))
+                    if (uiState.fileIsOpen.value) {
+                        MyTransparentButton(
+                            ImageVector.vectorResource(R.drawable.baseline_close_24),
+                            "Close file", true
+                        ) {
+                            model.resetUIMode(AppMode.LIVE)
                         }
                     }
                 }
+
+                // (2) Page left / page right
                 if (uiState.pagingEnabled.value) {
-                    Row(commonModifier, verticalAlignment = commonAlignment) {
-                        Column {
-                            MyTransparentButton(
-                                image = ImageVector.vectorResource(R.drawable.baseline_keyboard_double_arrow_left_24),
-                                contentDescription = "page left",
-                                enabled = uiState.pageLeftEnabled.value
-                            ) {
-                                doPageLeft()
-                            }
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        MyTransparentButton(
+                            image = ImageVector.vectorResource(R.drawable.baseline_keyboard_double_arrow_left_24),
+                            contentDescription = "page left",
+                            enabled = uiState.pageLeftEnabled.value
+                        ) {
+                            doPageLeft()
                         }
 
                         Spacer(Modifier.weight(1f))
 
-                        Column {
-                            MyTransparentButton(
-                                image = ImageVector.vectorResource(R.drawable.baseline_keyboard_double_arrow_right_24),
-                                contentDescription = "page right",
-                                enabled = uiState.pageRightEnabled.value
-                            )
-                            {
-                                doPageRight()
-                            }
+                        MyTransparentButton(
+                            image = ImageVector.vectorResource(R.drawable.baseline_keyboard_double_arrow_right_24),
+                            contentDescription = "page right",
+                            enabled = uiState.pageRightEnabled.value
+                        ) {
+                            doPageRight()
                         }
                     }
                 }
 
-                // Takes up excess vertical space:
+                // (3) Spare height — only the spacer absorbs it.
                 Spacer(modifier = Modifier.weight(1f))
 
-                val bnCRange = model.bnCRangeFlow.collectAsStateWithLifecycle()
-                val audioBoost = model.audioBoostFlow.collectAsStateWithLifecycle()
-                /*
-                This row is always present, but totally transparent when it is not
-                required. This allows the screen layout to not jump around.
-                */
                 if (buttonState.slidersButtonChecked.value) {
-                    Row(
-                        commonModifier,
-                        verticalAlignment = commonAlignment
+                    val bnCRange = model.bnCRangeFlow.collectAsStateWithLifecycle()
+                    val audioBoost = model.audioBoostFlow.collectAsStateWithLifecycle()
+                    Box(
+                        modifier = Modifier.fillMaxWidth(),
+                        contentAlignment = Alignment.Center
                     ) {
-                        Spacer(Modifier.weight(1f))
                         Column(
                             modifier = Modifier
                                 .widthIn(max = 400.dp)
-                                .background(Color.Transparent),
+                                .fillMaxWidth(),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
                             sliders.Compose(
@@ -973,133 +1031,126 @@ class SpectrogramUI(
                                 audioBoost
                             )
                         }
-                        Spacer(Modifier.weight(1f))
                     }
+                }
+
+                // (4) Overlay text (left) | slider button (right)
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.Bottom
+                ) {
+                    Box(Modifier.weight(1f)) {
+                        ComposeOverlayText(detailsText)
+                    }
+                    MyTransparentLatchingButton(
+                        buttonState.slidersButtonChecked,
+                        buttonState.slidersButtonEnabled,
+                        ImageVector.vectorResource(R.drawable.baseline_tune_24),
+                        "Show sliders",
+                        onSelectionChanged = { _: Boolean -> })
                 }
             }
 
-            val textHeightSp = 14.sp
-            Box(
-                Modifier
-                    .align(Alignment.BottomStart)
-                    .padding(5.dp)
-                    .padding(end = 40.dp)
-            ) {
-                val overlayTextMode = localOverlayTextMode.current
-                if (overlayTextMode != Settings.OverlayTextModeOptions.NONE.value) {
-                    val showTimeLine =
-                        overlayTextMode >= Settings.OverlayTextModeOptions.BASIC.value
-                    val showDetails =
-                        overlayTextMode == Settings.OverlayTextModeOptions.FULL.value
-                    val timeFormatter = remember {
-                        DateTimeFormatter.ofPattern("HH:mm:ss")
-                    }
-                    val sunsetFormatter = remember {
-                        DateTimeFormatter.ofPattern("hh:mm a")
-                    }
-                    var currentTimeText by remember {
-                        mutableStateOf(LocalTime.now().format(timeFormatter))
-                    }
-                    val location by model.locationFlow.collectAsStateWithLifecycle()
-                    var sunsetText by remember { mutableStateOf<String?>(null) }
-                    if (showTimeLine) {
-                        LaunchedEffect(Unit) {
-                            while (true) {
-                                currentTimeText =
-                                    LocalTime.now().format(timeFormatter)
-                                delay(1_000.milliseconds)
-                            }
-                        }
-                        LaunchedEffect(location) {
-                            val loc = location
-                            if (loc == null) {
-                                sunsetText = null
-                                return@LaunchedEffect
-                            }
-                            while (true) {
-                                val times = SunriseSunset.forLocation(
-                                    loc.latitude, loc.longitude
-                                )
-                                sunsetText = times.sunset
-                                    ?.format(sunsetFormatter)
-                                    ?.lowercase(Locale.getDefault())
-                                delay(60_000.milliseconds)
-                            }
-                        }
-                    }
-                    val details = if (showDetails) detailsText.value else null
-                    val overlayStyle = TextStyle(
-                        fontSize = textHeightSp,
-                        color = Color.Gray
-                    )
-                    if (details != null || showTimeLine) {
-                        Column(horizontalAlignment = Alignment.Start) {
-                            if (details != null) {
-                                Text(
-                                    details,
-                                    overflow = TextOverflow.Ellipsis,
-                                    style = overlayStyle
-                                )
-                            }
-                            if (showTimeLine) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.Start
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Filled.AccessTime,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(14.dp),
-                                        tint = Color.Gray
-                                    )
-                                    Spacer(Modifier.width(4.dp))
-                                    Text(
-                                        currentTimeText,
-                                        overflow = TextOverflow.Ellipsis,
-                                        style = overlayStyle
-                                    )
-                                    sunsetText?.let { sunset ->
-                                        Spacer(Modifier.width(8.dp))
-                                        Icon(
-                                            imageVector = Icons.Filled.WbTwilight,
-                                            contentDescription = null,
-                                            modifier = Modifier.size(14.dp),
-                                            tint = Color.Gray
-                                        )
-                                        Spacer(Modifier.width(4.dp))
-                                        Text(
-                                            sunset,
-                                            overflow = TextOverflow.Ellipsis,
-                                            style = overlayStyle
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            Box(
-                Modifier
-                    .align(Alignment.BottomEnd)
-                    .padding(5.dp)
-            ) {
-                MyTransparentLatchingButton(
-                    buttonState.slidersButtonChecked,
-                    buttonState.slidersButtonEnabled,
-                    ImageVector.vectorResource(R.drawable.baseline_tune_24),
-                    "Show sliders",
-                    onSelectionChanged = { _: Boolean -> })
-            }
-
-            // Layer 2: dynamic things:
+            // Heterodyne cursors: same data-area bounds as the chrome above.
             val sampleRateHz = uiState.samplingRateHz.value
             val autoHet = sampleRateHz != null &&
                 model.settings.isAutoTunedHeterodynePlayback(sampleRateHz)
             if (!autoHet || localShowHeterodyneReferenceLine.current)
                 heterodyneCursors.Compose()
-       }
+        }
+    }
+
+    @Composable
+    private fun ComposeOverlayText(detailsText: State<String?>) {
+        val overlayTextMode = localOverlayTextMode.current
+        if (overlayTextMode == Settings.OverlayTextModeOptions.NONE.value)
+            return
+
+        val showTimeLine =
+            overlayTextMode >= Settings.OverlayTextModeOptions.BASIC.value
+        val showDetails =
+            overlayTextMode == Settings.OverlayTextModeOptions.FULL.value
+        val timeFormatter = remember {
+            DateTimeFormatter.ofPattern("HH:mm")
+        }
+        var currentTimeText by remember {
+            mutableStateOf(LocalTime.now().format(timeFormatter))
+        }
+        val location by model.locationFlow.collectAsStateWithLifecycle()
+        var sunsetText by remember { mutableStateOf<String?>(null) }
+        if (showTimeLine) {
+            LaunchedEffect(Unit) {
+                while (true) {
+                    currentTimeText =
+                        LocalTime.now().format(timeFormatter)
+                    delay(1_000.milliseconds)
+                }
+            }
+            LaunchedEffect(location) {
+                val loc = location
+                if (loc == null) {
+                    sunsetText = null
+                    return@LaunchedEffect
+                }
+                while (true) {
+                    val times = SunriseSunset.forLocation(
+                        loc.latitude, loc.longitude
+                    )
+                    sunsetText = times.sunset?.format(timeFormatter)
+                    delay(60_000.milliseconds)
+                }
+            }
+        }
+        val details = if (showDetails) detailsText.value else null
+        val overlayStyle = SpectrogramOverlayStyle.textStyle
+        val iconSize = with(LocalDensity.current) {
+            SpectrogramOverlayStyle.textSize.toDp()
+        }
+        if (details != null || showTimeLine) {
+            Column(horizontalAlignment = Alignment.Start) {
+                if (details != null) {
+                    Text(
+                        details,
+                        overflow = TextOverflow.Ellipsis,
+                        style = overlayStyle
+                    )
+                }
+                if (showTimeLine) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Start
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.AccessTime,
+                            contentDescription = null,
+                            modifier = Modifier.size(iconSize),
+                            tint = SpectrogramOverlayStyle.textColor
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            currentTimeText,
+                            overflow = TextOverflow.Ellipsis,
+                            style = overlayStyle
+                        )
+                        sunsetText?.let { sunset ->
+                            Spacer(Modifier.width(8.dp))
+                            Icon(
+                                imageVector = Icons.Filled.WbTwilight,
+                                contentDescription = null,
+                                modifier = Modifier.size(iconSize),
+                                tint = SpectrogramOverlayStyle.textColor
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                sunset,
+                                overflow = TextOverflow.Ellipsis,
+                                style = overlayStyle
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private fun updateHeterodyneUIState() {
@@ -1423,7 +1474,7 @@ class SpectrogramUI(
         model: UIModel,
         amplitudePaneVisibility: Int,
         title: MutableState<String?>,
-        overlayComposer: @Composable (Modifier) -> Unit,
+        overlayComposer: @Composable (Modifier, GraphBase.GraphPadding) -> Unit,
         windowSizeClass: WindowSizeClass = currentWindowAdaptiveInfo().windowSizeClass,
     ) {
         // Timber.d("SpectrogramPaneSet called")
@@ -1629,6 +1680,11 @@ class SpectrogramUI(
 
         val manualRecordingChecked by buttonState.manualRecordingChecked
         val triggeredRecordingChecked by buttonState.triggeredRecordingChecked
+        val autoTriggerMode by uiState.autoTriggerMode
+        val classifierTrigger =
+            autoTriggerMode == Settings.AutoTriggerModeOptions.CLASSIFIER.value
+        // model.settings is not Compose state; localAutoId updates when Settings closes.
+        val classifierReady = localAutoId.current
         val liveRecordingAvailable =
             appMode.intValue == AppMode.LIVE.value &&
                 liveMode.intValue == LiveMode.STREAMING.value
@@ -1636,7 +1692,16 @@ class SpectrogramUI(
         val manualRecordingButtonEnabled =
             liveRecordingAvailable && (!triggeredRecordingChecked || manualRecordingChecked)
         val triggeredRecordingButtonEnabled =
-            liveRecordingAvailable && (!manualRecordingChecked || triggeredRecordingChecked)
+            liveRecordingAvailable &&
+                (!manualRecordingChecked || triggeredRecordingChecked) &&
+                (!classifierTrigger || classifierReady || triggeredRecordingChecked)
+
+        LaunchedEffect(classifierTrigger, classifierReady, triggeredRecordingChecked) {
+            disarmTriggeredRecordingIfClassifierNotReady(
+                classifierTrigger,
+                classifierReady,
+            )
+        }
         val isViewer = appMode.intValue == AppMode.VIEWER.value
         val audioChecked by buttonState.audioChecked
         // Keep Play while the first-run audio modal is open; switch to Pause only after Start
@@ -1740,7 +1805,11 @@ class SpectrogramUI(
                         true -> {
                             // Mutually exclusive trigger modes:
                             buttonState.manualRecordingChecked.value = false
-                            model.fileWriter?.configureTrigger(FileWriter.TriggerConfig(triggerType = TriggerType.AUTO))
+                            model.fileWriter?.configureTrigger(
+                                FileWriter.TriggerConfig(
+                                    triggerType = FileWriter.autoTriggerType(model.settings)
+                                )
+                            )
                         }
 
                         false -> {
@@ -1803,17 +1872,17 @@ class SpectrogramUI(
         stopAudioAndResetUi()
         val filename = DocumentHelper.getFileName(context, uriData.uri)
 
-        openFile(uriData.uri, filename ?: "(unknown)")
+        openFile(uriData.uri, filename ?: "(unknown)", waitForPaneSizesToSettle = true)
 
         buttonState.previousFileEnabled.value = uriData.previousAvailable
         buttonState.nextFileEnabled.value = uriData.nextAvailable
     }
 
-    private fun openFile(uri: Uri, filename: String) {
+    private fun openFile(uri: Uri, filename: String, waitForPaneSizesToSettle: Boolean = false) {
         uiState.processingFlag.value = true
         uiState.rawPageRange.value = null
         uiState.pagingState.value = null
-        model.openFile(uri, filename)
+        model.openFile(uri, filename, waitForPaneSizesToSettle)
     }
 
     private fun onViewingFileOpened(
@@ -1894,6 +1963,26 @@ class SpectrogramUI(
             uiState.pagingState.value?.reset(newSettings)
         }
 
+        uiState.autoTriggerMode.intValue = newSettings.autoTriggerMode
+
+        if (buttonState.triggeredRecordingChecked.value) {
+            val classifier = newSettings.isClassifierAutoTrigger()
+            val autoIdEnabled = newSettings.isAutoIdEnabled()
+            if (!disarmTriggeredRecordingIfClassifierNotReady(classifier, autoIdEnabled)) {
+                val triggerModeChanged = previousSettings == null ||
+                    previousSettings.isClassifierAutoTrigger() != classifier
+                val autoIdChanged = previousSettings == null ||
+                    previousSettings.isAutoIdEnabled() != autoIdEnabled
+                if (triggerModeChanged || autoIdChanged) {
+                    model.fileWriter?.configureTrigger(
+                        FileWriter.TriggerConfig(
+                            triggerType = FileWriter.autoTriggerType(newSettings)
+                        )
+                    )
+                }
+            }
+        }
+
         previousSettings?.let { prev ->
             if (newSettings.liveInputSource != prev.liveInputSource &&
                 uiState.liveMode.intValue in setOf(LiveMode.STREAMING.value, LiveMode.PAUSED.value)
@@ -1904,7 +1993,8 @@ class SpectrogramUI(
                 newSettings.autoHeterodyneLoMaxKhz != prev.autoHeterodyneLoMaxKhz ||
                 newSettings.audioPlaybackMode != prev.audioPlaybackMode ||
                 newSettings.autoTriggerRangeMinkHz != prev.autoTriggerRangeMinkHz ||
-                newSettings.autoTriggerRangeMaxkHz != prev.autoTriggerRangeMaxkHz
+                newSettings.autoTriggerRangeMaxkHz != prev.autoTriggerRangeMaxkHz ||
+                newSettings.autoTriggerMode != prev.autoTriggerMode
             ) {
                 uiState.autoHetAxisHighlightKey.intValue++
             }
@@ -2028,7 +2118,7 @@ class SpectrogramUI(
         buttonState.showMetadataEnabled.value = false
         buttonState.closeFileEnabled.value = false
 
-        // Request periodic location updates when we are in live mode:
+        // Fresh location now, then periodic updates while in live mode:
         model.locationTracker.startPeriodicUpdates()
 
         if (streaming)
@@ -2068,5 +2158,71 @@ fun ReleaseNotesDialog(onDismiss: () -> Unit) {
                 Text("Close")
             }
         }
+    )
+}
+
+
+/**
+ * Draws a [thicknessPx]-pixel frame around the edge: opaque for the outer
+ * (thickness − fade) pixels, then fading to transparent over [fadePx].
+ */
+private fun Modifier.liveStatusEdgeFade(
+    colour: Color,
+    thicknessPx: Float = 20f,
+    fadePx: Float = 17f,
+): Modifier = drawWithContent {
+    drawContent()
+    val transparent = colour.copy(alpha = 0f)
+    val opaqueFraction = ((thicknessPx - fadePx) / thicknessPx).coerceIn(0f, 1f)
+    // Outer edge → hold opaque, then fade inward to transparent.
+    val fadeOutStops = arrayOf(
+        0.0f to colour,
+        opaqueFraction to colour,
+        1.0f to transparent,
+    )
+    // Inward edge of a bottom/right strip → transparent, then opaque at the outer edge.
+    val fadeInStops = arrayOf(
+        0.0f to transparent,
+        (1f - opaqueFraction) to colour,
+        1.0f to colour,
+    )
+
+    // Top edge (opaque at y=0, transparent inward)
+    drawRect(
+        brush = Brush.verticalGradient(
+            colorStops = fadeOutStops,
+            startY = 0f,
+            endY = thicknessPx,
+        ),
+        size = Size(size.width, thicknessPx),
+    )
+    // Bottom edge
+    drawRect(
+        brush = Brush.verticalGradient(
+            colorStops = fadeInStops,
+            startY = size.height - thicknessPx,
+            endY = size.height,
+        ),
+        topLeft = Offset(0f, size.height - thicknessPx),
+        size = Size(size.width, thicknessPx),
+    )
+    // Left edge
+    drawRect(
+        brush = Brush.horizontalGradient(
+            colorStops = fadeOutStops,
+            startX = 0f,
+            endX = thicknessPx,
+        ),
+        size = Size(thicknessPx, size.height),
+    )
+    // Right edge
+    drawRect(
+        brush = Brush.horizontalGradient(
+            colorStops = fadeInStops,
+            startX = size.width - thicknessPx,
+            endX = size.width,
+        ),
+        topLeft = Offset(size.width - thicknessPx, 0f),
+        size = Size(thicknessPx, size.height),
     )
 }

@@ -89,8 +89,11 @@ abstract class GraphBase(
     fun ComposeFrame(
         modifier: Modifier,
         showGrid: Boolean,
-        overlayComposer: (@Composable (Modifier) -> Unit)? = null,
+        overlayComposer: (@Composable (Modifier, GraphPadding) -> Unit)? = null,
         frameGestures: ((GraphPadding, CoroutineScope) -> Modifier)? = null,
+        // Drawn on the border canvas via TitleBorder; must be a Compose input or the
+        // canvas is skipped and the previous title stays until the next axis redraw.
+        title: String? = null,
     ) {
         /**
          * This code needs some explanation. It is a mix of declarative (composition) and
@@ -117,6 +120,7 @@ abstract class GraphBase(
 
             val density = LocalDensity.current
             val colorScheme = MaterialTheme.colorScheme
+            (topBorder as? TitleBorder)?.setTitle(title)
 
             val borderPadding: MutableState<GraphPadding?> =
                 rememberSaveable { mutableStateOf(null) }
@@ -168,7 +172,13 @@ abstract class GraphBase(
                     /**
                      * We can't lay out the borders until we have the canvas size, which is finally
                      * available to us in this lambda.
+                     *
+                     * Read [title] and TitleBorder snapshot state so this canvas is not reused
+                     * when only the microphone name changed.
                      */
+                    @Suppress("UNUSED_VARIABLE")
+                    val titleSnapshot = title
+                    (topBorder as? TitleBorder)?.observeTitle()
                     val dataRect = layoutBorders(size, density)
 
                     drawBorders(
@@ -201,19 +211,15 @@ abstract class GraphBase(
             // Gestures and overlay sit above the border canvas so they receive pointer events.
             p?.let { safeBorderPadding ->
                 val scope = rememberCoroutineScope()
-                val padding = PaddingValues(
-                    start = maxOf(safeBorderPadding.leftDp.dp, 0.dp),
-                    top = safeBorderPadding.topDp.dp,
-                    end = safeBorderPadding.rightDp.dp,
-                    bottom = safeBorderPadding.bottomDp.dp + 0.5.dp
-                )
 
                 if (frameGestures != null) {
                     Box(Modifier.fillMaxSize().then(frameGestures(safeBorderPadding, scope)))
                 }
 
+                // Overlay chrome uses the full frame (only its own padding); plot
+                // inset is passed separately so cursors can stay axis-aligned.
                 if (overlayComposer != null) {
-                    overlayComposer(Modifier.padding(padding))
+                    overlayComposer(Modifier.fillMaxSize(), safeBorderPadding)
                 }
             }
         }
